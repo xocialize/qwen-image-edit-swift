@@ -207,9 +207,13 @@ public final class QwenVLPromptEncoder {
         embeds = try Self.mergeImageFeatures(
             textEmbeds: embeds, imageFeatures: allFeatures, padPositions: padPositions)
 
-        // 6. mRoPE 3D positions (multi-image: grids anchored sequentially).
-        let positionIds = Self.positionIds(
-            ids: ids, frames: processed.map(\.1), mergeSize: merge, imagePadId: imagePadId)
+        // 6. Positions: the diffusers reference runs the VL model WITHOUT
+        // mm_token_type_ids, so it falls back to PLAIN SEQUENTIAL positions on all
+        // three mRoPE axes (= standard 1D RoPE) — verified against the true SDPA
+        // inputs (monkeypatch capture: q/k max_abs 0.0 vs sequential, 90.2 vs the
+        // mRoPE grid). The 2511 DiT consumes embeddings produced this way; the
+        // mRoPE-grid variant is NOT what the reference pipeline computes.
+        let positionIds = Self.sequentialPositionIds(count: ids.count)
 
         // 7. Full causal forward; output = final-norm last hidden state.
         let hidden = model(
@@ -244,7 +248,15 @@ public final class QwenVLPromptEncoder {
         return concatenated(parts, axis: 1)
     }
 
+    /// Sequential positions broadcast to all 3 mRoPE axes (the reference behavior
+    /// for the edit-plus encoder call — see encode() step 6).
+    static func sequentialPositionIds(count: Int) -> MLXArray {
+        let pos = MLXArray((0..<count).map { Int32($0) })
+        return broadcast(pos.reshaped(1, 1, count), to: [3, 1, count])
+    }
+
     /// 3D mRoPE position ids over text + multiple image grids (HF get_rope_index).
+    /// NOT used by the reference edit-plus path — kept for reference/diagnostics.
     static func positionIds(
         ids: [Int], frames: [THW], mergeSize: Int, imagePadId: Int
     ) -> MLXArray {
