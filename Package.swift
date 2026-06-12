@@ -17,7 +17,10 @@ let package = Package(
     ],
     dependencies: [
         .package(url: "https://github.com/ml-explore/mlx-swift.git", from: "0.30.0"),
+        .package(url: "https://github.com/ml-explore/mlx-swift-lm.git", from: "3.31.3"),
         .package(url: "https://github.com/huggingface/swift-transformers", from: "1.1.6"),
+        // VL encoder backbone + HF-exact image preprocessing (parity-locked).
+        .package(path: "../qwen25vl-mlx-swift"),
     ],
     targets: [
         .target(
@@ -27,8 +30,11 @@ let package = Package(
                 .product(name: "MLXNN", package: "mlx-swift"),
                 .product(name: "MLXFast", package: "mlx-swift"),
                 .product(name: "MLXRandom", package: "mlx-swift"),
+                .product(name: "MLXLMCommon", package: "mlx-swift-lm"),
+                .product(name: "MLXVLM", package: "mlx-swift-lm"),
                 .product(name: "Tokenizers", package: "swift-transformers"),
                 .product(name: "Hub", package: "swift-transformers"),
+                .product(name: "Qwen25VL", package: "qwen25vl-mlx-swift"),
             ],
             path: "Sources/QwenImageEdit"
         ),
