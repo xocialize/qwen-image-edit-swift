@@ -196,6 +196,63 @@ final class EncoderBisectTests: XCTestCase {
         // MLP over golden ln2 input
         let mlpOut = layer0.mlp(internals["ln2_out"]!.asType(embeds.dtype))
         print("stage g mlp(golden ln2) vision cosine: \(visionCos(mlpOut, internals["mlp_out"]!))")
+
+        // --- stage h: attention sub-ops vs HF attn0 internals ---
+        let attn0 = try MLX.loadArrays(
+            url: Self.goldens.appendingPathComponent("encoder_attn0.safetensors"))
+        let attnMod = layer0.attention
+        let x = internals["ln1_out"]!.asType(embeds.dtype)
+        func maxAbs(_ a: MLXArray, _ b: MLXArray) -> Float {
+            max(abs(a.asType(.float32) - b.asType(.float32))).item(Float.self)
+        }
+        let qp = attnMod.wq(x)
+        let kp = attnMod.wk(x)
+        let vp = attnMod.wv(x)
+        print("stage h q_proj max_abs: \(maxAbs(qp, attn0["q_proj"]!))")
+        print("stage h k_proj max_abs: \(maxAbs(kp, attn0["k_proj"]!))")
+        print("stage h v_proj max_abs: \(maxAbs(vp, attn0["v_proj"]!))")
+
+        let B = x.dim(0); let L = x.dim(1)
+        var q4 = qp.reshaped(B, L, 28, 128).transposed(0, 2, 1, 3)
+        var k4 = kp.reshaped(B, L, 4, 128).transposed(0, 2, 1, 3)
+        let v4 = vp.reshaped(B, L, 4, 128).transposed(0, 2, 1, 3)
+        let (cosA, sinA) = MRoPE.cosSin(
+            positionIds: ourPos, headDim: 128, theta: 1_000_000, mropeSection: [16, 24, 24])
+        (q4, k4) = MRoPE.apply(q: q4, k: k4, cos: cosA.asType(q4.dtype), sin: sinA.asType(q4.dtype))
+        print("stage h q_rot max_abs: \(maxAbs(q4, attn0["q_rot"]!))")
+        print("stage h k_rot max_abs: \(maxAbs(k4, attn0["k_rot"]!))")
+
+        let ctx = MLXFast.scaledDotProductAttention(
+            queries: q4, keys: k4, values: v4, scale: 1.0 / Float(128).squareRoot(),
+            mask: .causal)
+        let ctxFlat = ctx.transposed(0, 2, 1, 3).reshaped(B, L, -1)
+        print("stage h sdpa(ctx) max_abs vs o_in: \(maxAbs(ctxFlat, attn0["o_in"]!))")
+        let cA = ctxFlat.asType(.float32).flattened()
+        let cB = attn0["o_in"]!.flattened()
+        let ctxCos = (sum(cA * cB) / (sqrt(sum(cA * cA)) * sqrt(sum(cB * cB)) + 1e-12))
+            .item(Float.self)
+        print("stage h sdpa(ctx) FULL cosine: \(ctxCos)")
+
+        // --- stage i: GQA-vs-mask discriminator ---
+        // (1) SDPA with k/v explicitly repeated to 28 heads (kills GQA broadcasting)
+        let kRep = repeated(k4, count: 7, axis: 1)
+        let vRep = repeated(v4, count: 7, axis: 1)
+        let ctx1 = MLXFast.scaledDotProductAttention(
+            queries: q4, keys: kRep, values: vRep, scale: 1.0 / Float(128).squareRoot(),
+            mask: .causal)
+        let ctx1F = ctx1.transposed(0, 2, 1, 3).reshaped(B, L, -1)
+        print("stage i sdpa(k/v repeated x7) max_abs: \(maxAbs(ctx1F, attn0["o_in"]!))")
+
+        // (2) manual attention: explicit matmul + additive causal mask + softmax
+        let scores = matmul(q4, kRep.transposed(0, 1, 3, 2)) * (1.0 / Float(128).squareRoot())
+        let iota = MLXArray(0..<L)
+        let causal = MLX.which(
+            iota[0..., .newAxis] .>= iota[.newAxis, 0...], MLXArray(Float(0)),
+            MLXArray(-Float.infinity))
+        let probs = softmax(scores + causal[.newAxis, .newAxis, 0..., 0...], axis: -1)
+        let ctx2 = matmul(probs, vRep)
+        let ctx2F = ctx2.transposed(0, 2, 1, 3).reshaped(B, L, -1)
+        print("stage i manual attention max_abs: \(maxAbs(ctx2F, attn0["o_in"]!))")
     }
 
     static func buildFullIds(encoder: QwenVLPromptEncoder, prompt: String, padCount: Int)
