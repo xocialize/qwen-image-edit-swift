@@ -13,7 +13,9 @@ let package = Package(
         .macOS(.v26)
     ],
     products: [
-        .library(name: "QwenImageEdit", targets: ["QwenImageEdit"])
+        .library(name: "QwenImageEdit", targets: ["QwenImageEdit"]),
+        // MLXEngine wrapper: the conformant `imageEdit` ModelPackage (contract 1.2.0).
+        .library(name: "MLXQwenImageEdit", targets: ["MLXQwenImageEdit"]),
     ],
     dependencies: [
         .package(url: "https://github.com/ml-explore/mlx-swift.git", from: "0.30.0"),
@@ -21,6 +23,8 @@ let package = Package(
         .package(url: "https://github.com/huggingface/swift-transformers", from: "1.1.6"),
         // VL encoder backbone + HF-exact image preprocessing (parity-locked).
         .package(path: "../qwen25vl-mlx-swift"),
+        // MLXEngine contract (MLXToolKit) for the wrapper target only.
+        .package(path: "../mlx-engine-swift"),
     ],
     targets: [
         .target(
@@ -38,10 +42,23 @@ let package = Package(
             ],
             path: "Sources/QwenImageEdit"
         ),
+        .target(
+            name: "MLXQwenImageEdit",
+            dependencies: [
+                "QwenImageEdit",
+                .product(name: "MLXToolKit", package: "mlx-engine-swift"),
+            ],
+            path: "Sources/MLXQwenImageEdit"
+        ),
         .testTarget(
             name: "QwenImageEditTests",
             dependencies: ["QwenImageEdit"],
             path: "Tests/QwenImageEditTests"
+        ),
+        .testTarget(
+            name: "MLXQwenImageEditTests",
+            dependencies: ["MLXQwenImageEdit"],
+            path: "Tests/MLXQwenImageEditTests"
         ),
     ]
 )
