@@ -128,6 +128,80 @@ final class EncoderBisectTests: XCTestCase {
         let cD = (sum(aD * bD) / (sqrt(sum(aD * aD)) * sqrt(sum(bD * bD)) + 1e-12))
             .item(Float.self)
         print("stage d (golden features -> our LLM): cosine \(cD)")
+
+        // --- stage e: position ids + merged rope cos/sin vs HF rope_golden ---
+        let rope = try MLX.loadArrays(
+            url: Self.goldens.appendingPathComponent("rope_golden.safetensors"))
+        let refPos = rope["position_ids"]!.asType(.int32)  // (3, 1, 291)
+        let fullIds = try Self.buildFullIds(encoder: encoder, prompt: prompt, padCount: 196)
+        let ourPos = QwenVLPromptEncoder.positionIds(
+            ids: fullIds, frames: [frame], mergeSize: 2, imagePadId: encoder.imagePadId)
+        XCTAssertEqual(ourPos.shape, refPos.shape, "position shape")
+        let posDiff = max(abs(ourPos.asType(.int32) - refPos)).item(Int32.self)
+        print("stage e positions: max_abs \(posDiff)")
+
+        let (cosT, sinT) = MRoPE.cosSin(
+            positionIds: ourPos, headDim: 128, theta: 1_000_000, mropeSection: [16, 24, 24])
+        // ours: (B,1,T,128); golden merged: (1,T,128)
+        let cosDiff = max(abs(cosT.asType(.float32).squeezed(axis: 1) - rope["cos_merged"]!))
+            .item(Float.self)
+        let sinDiff = max(abs(sinT.asType(.float32).squeezed(axis: 1) - rope["sin_merged"]!))
+            .item(Float.self)
+        print("stage e rope: cos max_abs \(cosDiff)  sin max_abs \(sinDiff)")
+
+        // --- stage f: per-layer ladder vs HF hidden_states (find divergence layer) ---
+        let layers = try MLX.loadArrays(
+            url: Self.goldens.appendingPathComponent("encoder_layers.safetensors"))
+        func visionCos(_ a: MLXArray, _ ref: MLXArray) -> Float {
+            // vision span in the FULL 291-seq: 64 (system) + 5 (Picture 1: +start) ... use 69..<265
+            let x = a[0..., 69..<265, 0...].asType(.float32).flattened()
+            let y = ref[0..., 69..<265, 0...].asType(.float32).flattened()
+            return (sum(x * y) / (sqrt(sum(x * x)) * sqrt(sum(y * y)) + 1e-12)).item(Float.self)
+        }
+        // layer_0 = post-merge embeddings
+        print("stage f layer_0 (embeds) vision cosine: \(visionCos(embeds, layers["layer_0"]!))")
+        var h = embeds
+        var checkpoints: [Int: MLXArray] = [:]
+        for (i, layer) in encoder.model.layers.enumerated() {
+            h = layer(h, positionIds: positionIds, mask: .causal, cache: nil)
+            checkpoints[i + 1] = h
+        }
+        for idx in [1, 2, 7, 14, 21, 27] {
+            if let ref = layers["layer_\(idx)"], let ours = checkpoints[idx] {
+                print("stage f layer_\(idx) vision cosine: \(visionCos(ours, ref))")
+            }
+        }
+
+        // --- stage g: layer-0 full-seq ids check + layer-1 internal ops ---
+        let l0ref = layers["layer_0"]!
+        let embedsMaxAbs = max(abs(embeds.asType(.float32) - l0ref)).item(Float.self)
+        print("stage g embeds full-seq max_abs: \(embedsMaxAbs)")
+
+        let internals = try MLX.loadArrays(
+            url: Self.goldens.appendingPathComponent("encoder_layer1.safetensors"))
+        let layer0 = encoder.model.layers[0]
+        let ln1 = layer0.inputNorm(embeds)
+        print("stage g ln1 vision cosine: \(visionCos(ln1, internals["ln1_out"]!))")
+        // attention over GOLDEN ln1 input — isolates the attention op itself
+        let attnOut = layer0.attention(
+            internals["ln1_out"]!.asType(embeds.dtype), positionIds: positionIds,
+            mask: .causal, cache: nil)
+        print("stage g attn(golden ln1) vision cosine: \(visionCos(attnOut, internals["attn_out"]!))")
+        let attnFull = attnOut.asType(.float32).flattened()
+        let attnRefFull = internals["attn_out"]!.flattened()
+        let attnCosFull = (sum(attnFull * attnRefFull)
+            / (sqrt(sum(attnFull * attnFull)) * sqrt(sum(attnRefFull * attnRefFull)) + 1e-12))
+            .item(Float.self)
+        print("stage g attn(golden ln1) FULL cosine: \(attnCosFull)")
+        // MLP over golden ln2 input
+        let mlpOut = layer0.mlp(internals["ln2_out"]!.asType(embeds.dtype))
+        print("stage g mlp(golden ln2) vision cosine: \(visionCos(mlpOut, internals["mlp_out"]!))")
+    }
+
+    static func buildFullIds(encoder: QwenVLPromptEncoder, prompt: String, padCount: Int)
+        throws -> [Int]
+    {
+        try buildIds(encoder: encoder, prompt: prompt, padCount: padCount)
     }
 
     static func buildIds(encoder: QwenVLPromptEncoder, prompt: String, padCount: Int)
