@@ -247,7 +247,9 @@ public final class QwenImageVAEDecoder: Module {
 /// applies latents_mean/std before calling decode, matching diffusers).
 public final class QwenImageVAE: Module {
     @ModuleInfo(key: "post_quant_conv") var postQuantConv: QwenCausalConv3d
+    @ModuleInfo(key: "quant_conv") var quantConv: QwenCausalConv3d
     @ModuleInfo(key: "decoder") var decoder: QwenImageVAEDecoder
+    @ModuleInfo(key: "encoder") var encoder: QwenImageVAEEncoder
 
     /// From vae/config.json (latents_mean / latents_std).
     public static let latentsMean: [Float] = [
@@ -262,7 +264,10 @@ public final class QwenImageVAE: Module {
     public override init() {
         self._postQuantConv.wrappedValue = QwenCausalConv3d(
             inChannels: 16, outChannels: 16, kernel: (1, 1, 1), padding: (0, 0))
+        self._quantConv.wrappedValue = QwenCausalConv3d(
+            inChannels: 32, outChannels: 32, kernel: (1, 1, 1), padding: (0, 0))
         self._decoder.wrappedValue = QwenImageVAEDecoder()
+        self._encoder.wrappedValue = QwenImageVAEEncoder()
         super.init()
     }
 
@@ -279,5 +284,125 @@ public final class QwenImageVAE: Module {
         let mean = MLXArray(latentsMean).reshaped(1, 16, 1, 1, 1)
         let std = MLXArray(latentsStd).reshaped(1, 16, 1, 1, 1)
         return latents * std + mean
+    }
+}
+
+// MARK: - Encoder (Wan-family, flat down_blocks list)
+
+/// One entry of the FLAT `encoder.down_blocks` ModuleList: either a resnet or a
+/// spatial downsample (asymmetric (0,1) pad + stride-2 conv; downsample3d entries
+/// also checkpoint a time_conv, unused for single-frame encode).
+public final class WanDownEntry: Module {
+    @ModuleInfo(key: "norm1") var norm1: WanRMSNorm?
+    @ModuleInfo(key: "conv1") var conv1: QwenCausalConv3d?
+    @ModuleInfo(key: "norm2") var norm2: WanRMSNorm?
+    @ModuleInfo(key: "conv2") var conv2: QwenCausalConv3d?
+    @ModuleInfo(key: "conv_shortcut") var convShortcut: QwenCausalConv3d?
+    @ModuleInfo(key: "resample") var resample: [Conv2d]?
+    @ModuleInfo(key: "time_conv") var timeConv: QwenCausalConv3d?
+
+    public init(resnetIn: Int, resnetOut: Int) {
+        self._norm1.wrappedValue = WanRMSNorm(channels: resnetIn)
+        self._conv1.wrappedValue = QwenCausalConv3d(
+            inChannels: resnetIn, outChannels: resnetOut, kernel: (3, 3, 3), padding: (1, 1))
+        self._norm2.wrappedValue = WanRMSNorm(channels: resnetOut)
+        self._conv2.wrappedValue = QwenCausalConv3d(
+            inChannels: resnetOut, outChannels: resnetOut, kernel: (3, 3, 3), padding: (1, 1))
+        self._convShortcut.wrappedValue = resnetIn != resnetOut
+            ? QwenCausalConv3d(
+                inChannels: resnetIn, outChannels: resnetOut, kernel: (1, 1, 1), padding: (0, 0))
+            : nil
+        self._resample.wrappedValue = nil
+        self._timeConv.wrappedValue = nil
+        super.init()
+    }
+
+    public init(downsample dim: Int, temporal: Bool) {
+        self._norm1.wrappedValue = nil
+        self._conv1.wrappedValue = nil
+        self._norm2.wrappedValue = nil
+        self._conv2.wrappedValue = nil
+        self._convShortcut.wrappedValue = nil
+        self._resample.wrappedValue = [
+            Conv2d(inputChannels: dim, outputChannels: dim, kernelSize: 3, stride: 2, padding: 0)
+        ]
+        self._timeConv.wrappedValue = temporal
+            ? QwenCausalConv3d(
+                inChannels: dim, outChannels: dim, kernel: (3, 1, 1), padding: (0, 0))
+            : nil
+        super.init()
+    }
+
+    public func callAsFunction(_ x: MLXArray) -> MLXArray {
+        if let resample {
+            let (b, t, h, w, c) = (x.dim(0), x.dim(1), x.dim(2), x.dim(3), x.dim(4))
+            var y = x.reshaped(b * t, h, w, c)
+            y = padded(
+                y,
+                widths: [
+                    IntOrPair([0, 0]), IntOrPair([0, 1]), IntOrPair([0, 1]), IntOrPair([0, 0]),
+                ])
+            y = resample[0](y)
+            return y.reshaped(b, t, y.dim(1), y.dim(2), y.dim(3))
+        }
+        let residual = convShortcut.map { $0(x) } ?? x
+        var h = conv1!(silu(norm1!(x)))
+        h = conv2!(silu(norm2!(h)))
+        return h + residual
+    }
+}
+
+public final class QwenImageVAEEncoder: Module {
+    @ModuleInfo(key: "conv_in") var convIn: QwenCausalConv3d
+    @ModuleInfo(key: "down_blocks") var downBlocks: [WanDownEntry]
+    @ModuleInfo(key: "mid_block") var midBlock: WanMidBlock
+    @ModuleInfo(key: "norm_out") var normOut: WanRMSNorm
+    @ModuleInfo(key: "conv_out") var convOut: QwenCausalConv3d
+
+    public override init() {
+        self._convIn.wrappedValue = QwenCausalConv3d(
+            inChannels: 3, outChannels: 96, kernel: (3, 3, 3), padding: (1, 1))
+        self._downBlocks.wrappedValue = [
+            WanDownEntry(resnetIn: 96, resnetOut: 96),
+            WanDownEntry(resnetIn: 96, resnetOut: 96),
+            WanDownEntry(downsample: 96, temporal: false),
+            WanDownEntry(resnetIn: 96, resnetOut: 192),
+            WanDownEntry(resnetIn: 192, resnetOut: 192),
+            WanDownEntry(downsample: 192, temporal: true),
+            WanDownEntry(resnetIn: 192, resnetOut: 384),
+            WanDownEntry(resnetIn: 384, resnetOut: 384),
+            WanDownEntry(downsample: 384, temporal: true),
+            WanDownEntry(resnetIn: 384, resnetOut: 384),
+            WanDownEntry(resnetIn: 384, resnetOut: 384),
+        ]
+        self._midBlock.wrappedValue = WanMidBlock(dim: 384)
+        self._normOut.wrappedValue = WanRMSNorm(channels: 384)
+        self._convOut.wrappedValue = QwenCausalConv3d(
+            inChannels: 384, outChannels: 32, kernel: (3, 3, 3), padding: (1, 1))
+        super.init()
+    }
+
+    public func callAsFunction(_ x: MLXArray) -> MLXArray {
+        var x = convIn(x)
+        for block in downBlocks { x = block(x) }
+        x = midBlock(x)
+        x = convOut(silu(normOut(x)))
+        return x
+    }
+}
+
+extension QwenImageVAE {
+    /// image: (B, 3, T, H, W) in [-1, 1] -> NORMALIZED latents (B, 16, T, H/8, W/8).
+    /// Mirrors diffusers `_encode_vae_image(..., sample_mode="argmax")`: the latent
+    /// dist mode = mean = first 16 of quant_conv's 32 channels, then (x - mean)/std.
+    public func encode(_ image: MLXArray) -> MLXArray {
+        var x = image.transposed(0, 2, 3, 4, 1)  // -> (B, T, H, W, C)
+        x = encoder(x)
+        x = quantConv(x)
+        x = x.transposed(0, 4, 1, 2, 3)  // -> (B, 32, T, h, w)
+        let mean16 = x[0..., ..<16]
+        let m = MLXArray(Self.latentsMean).reshaped(1, 16, 1, 1, 1)
+        let s = MLXArray(Self.latentsStd).reshaped(1, 16, 1, 1, 1)
+        return (mean16 - m) / s
     }
 }
