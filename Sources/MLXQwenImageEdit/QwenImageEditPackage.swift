@@ -191,3 +191,10 @@ public final class QwenImageEditPackage: ModelPackage {
         return out as Data
     }
 }
+
+extension QwenImageEditPackage {
+    /// The author one-liner the engine registers.
+    public nonisolated static var registration: PackageRegistration {
+        .of(QwenImageEditPackage.self)
+    }
+}
