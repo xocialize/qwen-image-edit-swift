@@ -24,7 +24,7 @@ let package = Package(
         // VL encoder backbone + HF-exact image preprocessing (parity-locked).
         .package(path: "../qwen25vl-mlx-swift"),
         // MLXEngine contract (MLXToolKit) for the wrapper target only.
-        .package(path: "../mlx-engine-swift"),
+        .package(url: "https://github.com/xocialize/mlx-engine-swift", from: "0.3.0"),
     ],
     targets: [
         .target(
