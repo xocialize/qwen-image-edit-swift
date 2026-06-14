@@ -1,7 +1,7 @@
 # qwen-image-edit-swift
 
 A Swift/MLX port of [Qwen/Qwen-Image-Edit-2511](https://huggingface.co/Qwen/Qwen-Image-Edit-2511)
-plus its MLXEngine **`imageEdit`** package — instruction-driven image editing (contract 1.2.0's
+plus its MLXEngine **`imageEdit`** package — instruction-driven image editing (contract 1.3.0's
 first `imageEdit` backer): identity-preserving edits and (in the core, tracked) multi-image fusion.
 
 - **`QwenImageEdit`** — the standalone inference port: Qwen2.5-VL-7B prompt+image conditioning
@@ -41,9 +41,12 @@ fusion (per-image VAE sizes + grids) is the tracked follow-up. `guidanceScale` i
 
 ## Status / consuming this package
 
-Weights are **not yet on the Hub** — load from a local `Qwen-Image-Edit-2511` snapshot. The package
+The **MLX-converted** weights are not yet on the Hub (the PyTorch source `Qwen/Qwen-Image-Edit-2511`
+is; this wrapper needs MLX weights and reads a local snapshot — it does not download) — load from a
+local `Qwen-Image-Edit-2511` snapshot. The package
 depends on **`qwen25vl-mlx-swift`** (VL conditioning) and **`mlx-engine-swift`** (the `MLXToolKit`
-contract) via local sibling paths (`.package(path: "../…")`); clone both as siblings to build. ~60 GB
-resident bf16 (20B DiT + VL-7B + fp32 VAE); 4-bit DiT+VL (~16 GB) is a tracked follow-up.
+contract) via tagged-URL net dependencies (`.package(url: "https://github.com/xocialize/qwen25vl-mlx-swift", from: "0.1.0")`
+and `.package(url: "https://github.com/xocialize/mlx-engine-swift", from: "0.3.0")`), so it builds
+standalone. ~60 GB resident bf16 (20B DiT + VL-7B + fp32 VAE); 4-bit DiT+VL (~16 GB) is a tracked follow-up.
 
 Apache-2.0 (weights) · MIT (port code).
