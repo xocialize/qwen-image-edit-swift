@@ -1,17 +1,25 @@
 # qwen-image-edit-swift
 
 A Swift/MLX port of [Qwen/Qwen-Image-Edit-2511](https://huggingface.co/Qwen/Qwen-Image-Edit-2511)
-plus its MLXEngine **`imageEdit`** package — instruction-driven image editing (contract 1.3.0's
-first `imageEdit` backer): identity-preserving edits and (in the core, tracked) multi-image fusion.
+plus its MLXEngine **`imageEdit`** packages — instruction-driven image editing (contract 1.3.0's
+first `imageEdit` backer): identity-preserving edits, **multi-image fusion**, and **content+style
+style transfer** (TeleStyleV2).
 
 - **`QwenImageEdit`** — the standalone inference port: Qwen2.5-VL-7B prompt+image conditioning
   (via [qwen25vl-mlx-swift](https://github.com/xocialize/qwen25vl-mlx-swift)) → 20B 60-layer
   `zero_cond_t` double-stream DiT (Lens block family) → Wan 3D causal VAE. Reference = diffusers
   `QwenImageEditPlusPipeline` (the VL encoder runs **plain sequential 1D RoPE**, not the mRoPE grid
   — diffusers omits `mm_token_type_ids` so HF falls back; proven by true-SDPA-input capture).
+  `generate(images:)` does N-image conditioning (per-image VAE cond latents + grids); image 0 is the
+  content, later images are extra references ("Picture 1/2/…").
 - **`MLXQwenImageEdit`** — the thin MLXEngine wrapper (`QwenImageEditPackage`, PackageID
-  `qwen-image-edit`): the canonical `IEditRequest`/`IEditResponse` surface, license declaration,
-  requirements manifest, and PNG artifact encoding.
+  `qwen-image-edit`): the canonical `IEditRequest`/`IEditResponse` surface, multi-image, license
+  declaration, requirements manifest, and PNG artifact encoding.
+- **`MLXTeleStyle`** — [TeleStyleV2](https://github.com/Tele-AI/TeleStyleV2) content-preserving
+  **style transfer** (`TeleStylePackage`, PackageID `telestyle-v2`): the `imageEdit` surface with a
+  **`styleTransfer` mode** (image 0 = content, image 1 = style). Same `QwenImageEdit` core over a
+  pre-fused snapshot (style + Lightning-4step DMD LoRAs merged at scale 1.0); 4-step DMD defaults.
+  Weights: [`mlx-community/TeleStyleV2-Qwen-Image-Edit-2511-bf16`](https://huggingface.co/mlx-community/TeleStyleV2-Qwen-Image-Edit-2511-bf16).
 
 ## Parity
 

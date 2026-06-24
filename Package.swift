@@ -16,6 +16,9 @@ let package = Package(
         .library(name: "QwenImageEdit", targets: ["QwenImageEdit"]),
         // MLXEngine wrapper: the conformant `imageEdit` ModelPackage (contract 1.2.0).
         .library(name: "MLXQwenImageEdit", targets: ["MLXQwenImageEdit"]),
+        // TeleStyleV2: content+style transfer (imageEdit + styleTransfer mode), fused
+        // style + Lightning-4step LoRAs on the same QwenImageEdit core.
+        .library(name: "MLXTeleStyle", targets: ["MLXTeleStyle"]),
     ],
     dependencies: [
         .package(url: "https://github.com/ml-explore/mlx-swift.git", from: "0.30.0"),
@@ -50,6 +53,14 @@ let package = Package(
             ],
             path: "Sources/MLXQwenImageEdit"
         ),
+        .target(
+            name: "MLXTeleStyle",
+            dependencies: [
+                "QwenImageEdit",
+                .product(name: "MLXToolKit", package: "mlx-engine-swift"),
+            ],
+            path: "Sources/MLXTeleStyle"
+        ),
         .testTarget(
             name: "QwenImageEditTests",
             dependencies: ["QwenImageEdit"],
@@ -59,6 +70,11 @@ let package = Package(
             name: "MLXQwenImageEditTests",
             dependencies: ["MLXQwenImageEdit"],
             path: "Tests/MLXQwenImageEditTests"
+        ),
+        .testTarget(
+            name: "MLXTeleStyleTests",
+            dependencies: ["MLXTeleStyle"],
+            path: "Tests/MLXTeleStyleTests"
         ),
     ]
 )

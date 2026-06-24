@@ -1,5 +1,5 @@
 {
-  "originHash" : "fd8ef53e3c9761aa30b510938ca5de7c58d31a5f920c9557196337d2f30abe04",
+  "originHash" : "cc7ac81331c0786a1b9a207ee57a3645937c180c6ada48e4152ff6d1fbd968b8",
   "pins" : [
     {
       "identity" : "eventsource",
@@ -8,6 +8,15 @@
       "state" : {
         "revision" : "a3a85a85214caf642abaa96ae664e4c772a59f6e",
         "version" : "1.4.1"
+      }
+    },
+    {
+      "identity" : "mlx-engine-swift",
+      "kind" : "remoteSourceControl",
+      "location" : "https://github.com/xocialize/mlx-engine-swift",
+      "state" : {
+        "revision" : "0e0398b4ee3f1bd9707e10ea7024c5c35164c71e",
+        "version" : "0.10.0"
       }
     },
     {
@@ -26,6 +35,15 @@
       "state" : {
         "revision" : "1c05248bb0899e2a7a4962b84d319cf12f4e12aa",
         "version" : "3.31.3"
+      }
+    },
+    {
+      "identity" : "qwen25vl-mlx-swift",
+      "kind" : "remoteSourceControl",
+      "location" : "https://github.com/xocialize/qwen25vl-mlx-swift",
+      "state" : {
+        "revision" : "b2f316224a22a91b9bb8c2ec11bfe62c7eafab90",
+        "version" : "0.1.0"
       }
     },
     {

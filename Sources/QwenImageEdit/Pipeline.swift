@@ -79,7 +79,8 @@ public final class QwenImageEditGenerator {
         self.vae = vae
     }
 
-    /// Edit `image` per `prompt`. Returns interleaved RGB8 + dimensions.
+    /// Edit a single `image` per `prompt`. Returns interleaved RGB8 + dimensions.
+    /// Thin wrapper over the multi-image core (`generate(images:)`).
     public func generate(
         image: (rgb: [UInt8], width: Int, height: Int),
         prompt: String,
@@ -89,31 +90,69 @@ public final class QwenImageEditGenerator {
         seed: UInt64 = 0,
         progress: ((Int, Int) -> Void)? = nil
     ) throws -> (pixels: [UInt8], width: Int, height: Int) {
-        let ratio = Double(image.width) / Double(image.height)
-        // Target + VAE conditioning sizes: 1024²-area, ratio-preserved, /32.
-        let (tw, th) = QwenVLPromptEncoder.calculateDimensions(
-            targetArea: 1024 * 1024, ratio: ratio)
-        let (vw, vh) = (tw, th)  // same formula and area for the conditioning branch
+        try generate(
+            images: [image], prompt: prompt, negativePrompt: negativePrompt,
+            steps: steps, trueCFGScale: trueCFGScale, seed: seed, progress: progress)
+    }
 
-        // 1. Prompt encoding (the VL branch resizes to 384²-area internally).
-        let posEmbeds = try encoder.encode(prompt: prompt, images: [image])
-        let negEmbeds = try encoder.encode(prompt: negativePrompt, images: [image])
-
-        // 2. Conditioning latents: LANCZOS to VAE size, [-1,1], encode, pack.
-        let resized = PILLanczosResize.resize(
-            rgb: image.rgb, width: image.width, height: image.height,
-            outWidth: vw, outHeight: vh)
-        var chw = [Float](repeating: 0, count: 3 * vh * vw)
-        let plane = vh * vw
-        for i in 0..<plane {
-            let p = i * 3
-            chw[i] = Float(resized[p]) / 255 * 2 - 1
-            chw[plane + i] = Float(resized[p + 1]) / 255 * 2 - 1
-            chw[2 * plane + i] = Float(resized[p + 2]) / 255 * 2 - 1
+    /// Multi-image edit / style transfer. Images are conditioning inputs in prompt
+    /// order ("Picture 1", "Picture 2", …); for TeleStyleV2, image 0 = content,
+    /// image 1 = style (the fused LoRA learned the order semantics — there is no
+    /// role token). Mirrors the diffusers QwenImageEditPlusPipeline:
+    ///   - VL branch consumes all images (handled inside `encoder.encode`);
+    ///   - each image is VAE-encoded at its own 1024²-area /32 size, packed, and the
+    ///     per-image cond latents are concatenated on the sequence axis;
+    ///   - `imgShapes` = [output grid] + [one grid per conditioning image] (RoPE).
+    /// Output size follows the first (content) image's aspect, matching the reference.
+    public func generate(
+        images: [(rgb: [UInt8], width: Int, height: Int)],
+        prompt: String,
+        negativePrompt: String = " ",
+        steps: Int = 20,
+        trueCFGScale: Float = 4.0,
+        seed: UInt64 = 0,
+        progress: ((Int, Int) -> Void)? = nil
+    ) throws -> (pixels: [UInt8], width: Int, height: Int) {
+        guard let content = images.first else {
+            throw QwenImageEditError.invalidInput("at least one image is required")
         }
+        // Target (output) size: 1024²-area, ratio of the content image, /32.
+        let (tw, th) = QwenVLPromptEncoder.calculateDimensions(
+            targetArea: 1024 * 1024, ratio: Double(content.width) / Double(content.height))
+
+        // 1. Prompt encoding (the VL branch resizes each image to 384²-area internally
+        //    and emits "Picture i" blocks for all images). The negative branch is only
+        //    needed when true CFG is active (scale > 1); the DMD/Lightning tier runs at
+        //    scale 1.0 (no CFG), so we skip it — matching the reference `do_true_cfg`.
+        let doCFG = trueCFGScale > 1
+        let posEmbeds = try encoder.encode(prompt: prompt, images: images)
+        let negEmbeds = doCFG ? try encoder.encode(prompt: negativePrompt, images: images) : nil
         let dtype = posEmbeds.dtype
-        let condPixels = MLXArray(chw, [1, 3, 1, vh, vw]).asType(dtype)
-        let condLatents = QwenImagePipeline.packLatents(vae.encode(condPixels))
+
+        // 2. Per-image VAE conditioning latents (each at its own 1024²-area /32 size),
+        //    concatenated on the sequence axis — reference cat(all_image_latents, dim=1).
+        var condParts: [MLXArray] = []
+        var condShapes: [(Int, Int, Int)] = []
+        for image in images {
+            let (vw, vh) = QwenVLPromptEncoder.calculateDimensions(
+                targetArea: 1024 * 1024, ratio: Double(image.width) / Double(image.height))
+            let resized = PILLanczosResize.resize(
+                rgb: image.rgb, width: image.width, height: image.height,
+                outWidth: vw, outHeight: vh)
+            var chw = [Float](repeating: 0, count: 3 * vh * vw)
+            let plane = vh * vw
+            for i in 0..<plane {
+                let p = i * 3
+                chw[i] = Float(resized[p]) / 255 * 2 - 1
+                chw[plane + i] = Float(resized[p + 1]) / 255 * 2 - 1
+                chw[2 * plane + i] = Float(resized[p + 2]) / 255 * 2 - 1
+            }
+            let condPixels = MLXArray(chw, [1, 3, 1, vh, vw]).asType(dtype)
+            condParts.append(QwenImagePipeline.packLatents(vae.encode(condPixels)))
+            condShapes.append((1, vh / 16, vw / 16))
+        }
+        let condLatents =
+            condParts.count == 1 ? condParts[0] : concatenated(condParts, axis: 1)
 
         // 3. Seeded target noise, packed.
         let key = MLXRandom.key(seed)
@@ -124,10 +163,10 @@ public final class QwenImageEditGenerator {
         let mu = QwenImagePipeline.calculateShift(imageSeqLen: latents.dim(1))
         let sigmas = QwenImagePipeline.shiftedSigmas(steps: steps, mu: mu)
 
-        let imgShapes = [(1, th / 16, tw / 16), (1, vh / 16, vw / 16)]
+        let imgShapes = [(1, th / 16, tw / 16)] + condShapes
         let targetLen = latents.dim(1)
 
-        // 5. Denoise loop with true CFG.
+        // 5. Denoise loop (true CFG when scale > 1, else single positive pass).
         for i in 0..<steps {
             let t = MLXArray([sigmas[i]])
             let hidden = concatenated([latents, condLatents.asType(dtype)], axis: 1)
@@ -135,11 +174,17 @@ public final class QwenImageEditGenerator {
                 hiddenStates: hidden, encoderHiddenStates: posEmbeds,
                 encoderHiddenStatesMask: nil, timestep: t, imgShapes: imgShapes
             )[0..., ..<targetLen]
-            let neg = transformer(
-                hiddenStates: hidden, encoderHiddenStates: negEmbeds,
-                encoderHiddenStatesMask: nil, timestep: t, imgShapes: imgShapes
-            )[0..., ..<targetLen]
-            let noise = QwenImagePipeline.guidedNoise(pos: pos, neg: neg, scale: trueCFGScale)
+            let noise: MLXArray
+            if let negEmbeds {
+                let neg = transformer(
+                    hiddenStates: hidden, encoderHiddenStates: negEmbeds,
+                    encoderHiddenStatesMask: nil, timestep: t, imgShapes: imgShapes
+                )[0..., ..<targetLen]
+                noise = QwenImagePipeline.guidedNoise(
+                    pos: pos, neg: neg, scale: trueCFGScale)
+            } else {
+                noise = pos
+            }
             latents = latents + (sigmas[i + 1] - sigmas[i]) * noise
             eval(latents)
             progress?(i + 1, steps)

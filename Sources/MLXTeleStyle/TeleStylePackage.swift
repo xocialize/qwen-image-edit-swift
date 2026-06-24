@@ -1,10 +1,14 @@
-// MLXEngine `imageEdit` package over the QwenImageEdit core — the engine's first
-// imageEdit surface (contract 1.2.0).
+// MLXEngine package for TeleStyleV2 — content-preserving image style transfer.
 //
-// Qwen-Image-Edit-2511 (Apache-2.0): Qwen2.5-VL-7B-conditioned 20B zero_cond_t DiT
-// + Wan 3D causal VAE. The Swift core is parity-locked against the P2 PT goldens
-// (DiT 0.99986 · VAE decode 73.7 dB · VAE encode 1.0 · encoder 0.9977 fp32); this
-// wrapper is a thin conformance layer — all model logic lives in `QwenImageEdit`.
+// TeleStyleV2 (Apache-2.0, Tele-AI) is the QwenImageEdit-2511 base with two LoRAs
+// fused at scale 1.0: the TeleStyleV2 style LoRA + the QIE-2511 Lightning 4-step
+// (DMD) LoRA. It is therefore the SAME core (`QwenImageEdit`) over a different
+// (fused) snapshot — there is no architecture change, no role token: image 0 is the
+// content, image 1 the style reference, and the fused LoRA supplies the behavior.
+//
+// Surface: the canonical `imageEdit` capability with a `styleTransfer` mode tag
+// (per C4 — one multi-image editor, the tag declares intent; not a new capability).
+// Defaults: 4 steps, true-CFG 1.0 (DMD: single positive pass).
 
 import CoreGraphics
 import Foundation
@@ -14,9 +18,14 @@ import MLXToolKit
 import QwenImageEdit
 import UniformTypeIdentifiers
 
-/// Init-time configuration (C9): the 2511 snapshot root and generation defaults.
-public struct QwenImageEditConfiguration: PackageConfiguration, ModelStorable {
-    /// Snapshot root with `transformer/`, `vae/`, `text_encoder/`, `processor/`.
+/// The `styleTransfer` imageEdit mode (rawValue matches `MLXToolKit.Mode.styleTransfer`
+/// in mlx-engine-swift ≥ next tag; used as a literal here for the current pinned tag).
+public let styleTransferMode = Mode(rawValue: "styleTransfer")
+
+/// Init-time configuration (C9): the fused TeleStyleV2-2511 snapshot + DMD defaults.
+public struct TeleStyleConfiguration: PackageConfiguration, ModelStorable {
+    /// Snapshot root with the FUSED `transformer/` + base `vae/`, `text_encoder/`,
+    /// `processor/` (the merge tool produces this layout).
     public var snapshotPath: String
     public var defaultSteps: Int
     public var defaultTrueCFGScale: Float
@@ -24,9 +33,9 @@ public struct QwenImageEditConfiguration: PackageConfiguration, ModelStorable {
 
     public init(
         snapshotPath: String =
-            "/Volumes/DEV_VOL1/VideoResearch/qwen-image-edit-models/Qwen-Image-Edit-2511",
-        defaultSteps: Int = 20,
-        defaultTrueCFGScale: Float = 4.0,
+            "/Volumes/DEV_VOL1/VideoResearch/qwen-image-edit-models/TeleStyleV2-2511",
+        defaultSteps: Int = 4,
+        defaultTrueCFGScale: Float = 1.0,
         modelsRootDirectory: URL? = nil
     ) {
         self.snapshotPath = snapshotPath
@@ -40,32 +49,35 @@ public struct QwenImageEditConfiguration: PackageConfiguration, ModelStorable {
     }
 }
 
-public enum QwenImageEditPackageError: Error, LocalizedError {
+public enum TeleStylePackageError: Error, LocalizedError {
     case unreadableSnapshot(String)
     case imageDecode
     case pngEncode
+    case noImages
 
     public var errorDescription: String? {
         switch self {
-        case .unreadableSnapshot(let p): return "2511 snapshot not readable at \(p)."
+        case .unreadableSnapshot(let p): return "TeleStyleV2 snapshot not readable at \(p)."
         case .imageDecode: return "Could not decode an input image."
         case .pngEncode: return "PNG encoding failed."
+        case .noImages: return "imageEdit/styleTransfer requires at least one image."
         }
     }
 }
 
 @InferenceActor
-public final class QwenImageEditPackage: ModelPackage {
-    public typealias Configuration = QwenImageEditConfiguration
+public final class TeleStylePackage: ModelPackage {
+    public typealias Configuration = TeleStyleConfiguration
 
     public nonisolated static var manifest: PackageManifest {
         PackageManifest(
             license: LicenseDeclaration(weightLicense: .apache2, portCodeLicense: .mit),
             provenance: Provenance(
-                sourceRepo: "Qwen/Qwen-Image-Edit-2511", revision: "main", tier: 1),
+                sourceRepo: "Tele-AI/TeleStyleV2", revision: "main", tier: 1),
             requirements: RequirementsManifest(
-                // Measured regime (1024², 20 steps, bf16 DiT + bf16 VL-7B + fp32 VAE):
-                // ~60 GB resident. 4-bit DiT+VL is the tracked follow-up (~16 GB).
+                // Same footprint as the QwenImageEdit base (fused LoRA adds no params):
+                // ~60 GB resident bf16 (20B DiT + bf16 VL-7B + fp32 VAE). 4-bit is the
+                // tracked follow-up (~16 GB). DMD tier runs 4 steps.
                 footprints: [QuantFootprint(quant: .bf16, residentBytes: 60_000_000_000)],
                 requiredBackends: [.metalGPU],
                 os: OSRequirement(minMacOS: SemanticVersion(major: 26, minor: 0, patch: 0)),
@@ -74,11 +86,12 @@ public final class QwenImageEditPackage: ModelPackage {
             specialties: [],
             surfaces: [
                 IEditContract.descriptor(
-                    name: "qwen-image-edit",
-                    summary: "Qwen-Image-Edit-2511 instruction editing (20B zero_cond_t "
-                        + "DiT + Qwen2.5-VL conditioning): multi-image fusion, identity-"
-                        + "preserving edits, 1024²-area output, 20-step true CFG.",
-                    modes: []
+                    name: "telestyle-v2",
+                    summary: "TeleStyleV2 content-preserving style transfer (Qwen-Image-"
+                        + "Edit-2511 + fused style/DMD LoRAs): image 0 = content, image 1 "
+                        + "= style; 4-step DMD, 1024²-area output. Also serves plain "
+                        + "instruction edits (content image only).",
+                    modes: [styleTransferMode]
                 )
             ]
         )
@@ -96,7 +109,7 @@ public final class QwenImageEditPackage: ModelPackage {
         let snapshot = URL(fileURLWithPath: configuration.snapshotPath)
         guard FileManager.default.fileExists(
             atPath: snapshot.appendingPathComponent("transformer").path)
-        else { throw QwenImageEditPackageError.unreadableSnapshot(snapshot.path) }
+        else { throw TeleStylePackageError.unreadableSnapshot(snapshot.path) }
 
         let encoder = try await QwenVLPromptEncoder.load(snapshot: snapshot)
         let transformer = try QwenImageEditWeights.loadDiTFromPT(
@@ -116,12 +129,11 @@ public final class QwenImageEditPackage: ModelPackage {
         guard request.capability == .imageEdit, let edit = request as? IEditRequest else {
             throw PackageError.unsupportedCapability(request.capability)
         }
-        guard !edit.images.isEmpty else {
-            throw QwenImageEditPackageError.imageDecode
-        }
-        // Multi-image fusion: decode all conditioning images in prompt order
-        // ("Picture 1", "Picture 2", …); the core packs per-image VAE latents + grids.
+        guard !edit.images.isEmpty else { throw TeleStylePackageError.noImages }
         try Task.checkCancellation()
+
+        // Decode every conditioning image in prompt order (image 0 = content, image 1 =
+        // style for styleTransfer); the core packs per-image VAE latents + grids.
         let inputs = try edit.images.map { try Self.decodeRGB($0.data) }
 
         let (pixels, w, h) = try generator.generate(
@@ -139,13 +151,13 @@ public final class QwenImageEditPackage: ModelPackage {
         return IEditResponse(image: Image(format: .png, data: png, width: w, height: h))
     }
 
-    /// PNG/JPEG Data -> interleaved RGB8 in sRGB.
+    /// PNG/JPEG/WebP Data -> interleaved RGB8 in sRGB.
     nonisolated static func decodeRGB(_ data: Data) throws
         -> (rgb: [UInt8], width: Int, height: Int)
     {
         guard let source = CGImageSourceCreateWithData(data as CFData, nil),
               let cg = CGImageSourceCreateImageAtIndex(source, 0, nil)
-        else { throw QwenImageEditPackageError.imageDecode }
+        else { throw TeleStylePackageError.imageDecode }
         let w = cg.width
         let h = cg.height
         var rgba = [UInt8](repeating: 0, count: w * h * 4)
@@ -153,7 +165,7 @@ public final class QwenImageEditPackage: ModelPackage {
             data: &rgba, width: w, height: h, bitsPerComponent: 8, bytesPerRow: w * 4,
             space: CGColorSpace(name: CGColorSpace.sRGB)!,
             bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue)
-        else { throw QwenImageEditPackageError.imageDecode }
+        else { throw TeleStylePackageError.imageDecode }
         ctx.draw(cg, in: CGRect(x: 0, y: 0, width: w, height: h))
         var rgb = [UInt8](repeating: 0, count: w * h * 3)
         for i in 0..<(w * h) {
@@ -171,7 +183,7 @@ public final class QwenImageEditPackage: ModelPackage {
             data: nil, width: width, height: height, bitsPerComponent: 8,
             bytesPerRow: width * 4, space: cs,
             bitmapInfo: CGImageAlphaInfo.noneSkipLast.rawValue)
-        else { throw QwenImageEditPackageError.pngEncode }
+        else { throw TeleStylePackageError.pngEncode }
         let buf = ctx.data!.bindMemory(to: UInt8.self, capacity: width * height * 4)
         for i in 0..<(width * height) {
             buf[i * 4] = pixels[i * 3]
@@ -179,22 +191,22 @@ public final class QwenImageEditPackage: ModelPackage {
             buf[i * 4 + 2] = pixels[i * 3 + 2]
             buf[i * 4 + 3] = 255
         }
-        guard let image = ctx.makeImage() else { throw QwenImageEditPackageError.pngEncode }
+        guard let image = ctx.makeImage() else { throw TeleStylePackageError.pngEncode }
         let out = NSMutableData()
         guard let dest = CGImageDestinationCreateWithData(
             out, UTType.png.identifier as CFString, 1, nil)
-        else { throw QwenImageEditPackageError.pngEncode }
+        else { throw TeleStylePackageError.pngEncode }
         CGImageDestinationAddImage(dest, image, nil)
         guard CGImageDestinationFinalize(dest) else {
-            throw QwenImageEditPackageError.pngEncode
+            throw TeleStylePackageError.pngEncode
         }
         return out as Data
     }
 }
 
-extension QwenImageEditPackage {
+extension TeleStylePackage {
     /// The author one-liner the engine registers.
     public nonisolated static var registration: PackageRegistration {
-        .of(QwenImageEditPackage.self)
+        .of(TeleStylePackage.self)
     }
 }
