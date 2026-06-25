@@ -61,7 +61,11 @@ public final class QwenVLPromptEncoder {
     }
 
     /// Load from a 2511 snapshot root (`text_encoder/` + `processor/`).
-    public static func load(snapshot: URL, dtype: DType = .bfloat16) async throws
+    ///
+    /// `bits` (4/8) quantizes the VL-7B text model after load (the conditioning bulk; the
+    /// small vision tower is left full precision). The model is eval'd immediately so the
+    /// bf16 originals free before the caller loads the DiT — keeping the load peak down.
+    public static func load(snapshot: URL, dtype: DType = .bfloat16, bits: Int? = nil) async throws
         -> QwenVLPromptEncoder
     {
         let encoderDir = snapshot.appendingPathComponent("text_encoder")
@@ -101,6 +105,10 @@ public final class QwenVLPromptEncoder {
             }
         }
         try QwenImageEditWeights.verifyAndLoad(model: model, weights: llm, label: "VL-7B")
+        if let bits {
+            quantize(model: model, groupSize: 64, bits: bits)
+            eval(model)  // materialize int4 + free the bf16 originals now
+        }
 
         // --- vision tower ---
         var visionDict = visionJSON
