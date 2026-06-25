@@ -46,6 +46,15 @@ public struct QwenImageEditTurboConfiguration: PackageConfiguration, ModelStorab
     /// conditioning: int4 here visibly degrades quality (graininess), so int8 is the safer
     /// footprint/quality tradeoff.
     public var modulationBits: Int?
+    /// Path to a pre-quantized DiT safetensors (from `QwenImageEditWeights.saveQuantizedDiT`).
+    /// When set, the DiT loads straight as int4 with NO bf16 peak — `ditBits`/`modulationBits`
+    /// are then read from the file's metadata and ignored here. This is what makes a true
+    /// low-RAM load possible (vs quantize-after-bf16-load, which peaks at ~40 GB).
+    public var quantizedDiTPath: String?
+    /// Path to a pre-quantized VL-7B text model (from `QwenVLPromptEncoder.saveQuantizedTextModel`).
+    /// When set, the encoder loads its LLM straight as int4 — removing the bf16 encoder load
+    /// that is the peak ceiling once the DiT is pre-quantized.
+    public var quantizedEncoderPath: String?
     public var defaultSteps: Int
     public var defaultTrueCFGScale: Float
     public var modelsRootDirectory: URL?
@@ -60,6 +69,8 @@ public struct QwenImageEditTurboConfiguration: PackageConfiguration, ModelStorab
         ditBits: Int? = nil,
         encoderBits: Int? = nil,
         modulationBits: Int? = nil,
+        quantizedDiTPath: String? = nil,
+        quantizedEncoderPath: String? = nil,
         defaultSteps: Int = 4,
         defaultTrueCFGScale: Float = 1.0,
         modelsRootDirectory: URL? = nil
@@ -70,6 +81,8 @@ public struct QwenImageEditTurboConfiguration: PackageConfiguration, ModelStorab
         self.ditBits = ditBits
         self.encoderBits = encoderBits
         self.modulationBits = modulationBits
+        self.quantizedDiTPath = quantizedDiTPath
+        self.quantizedEncoderPath = quantizedEncoderPath
         self.defaultSteps = defaultSteps
         self.defaultTrueCFGScale = defaultTrueCFGScale
         self.modelsRootDirectory = modelsRootDirectory
@@ -77,7 +90,7 @@ public struct QwenImageEditTurboConfiguration: PackageConfiguration, ModelStorab
 
     private enum CodingKeys: String, CodingKey {
         case snapshotPath, loraPath, strength, ditBits, encoderBits, modulationBits
-        case defaultSteps, defaultTrueCFGScale
+        case quantizedDiTPath, quantizedEncoderPath, defaultSteps, defaultTrueCFGScale
     }
 }
 
@@ -112,9 +125,10 @@ public final class QwenImageEditTurboPackage: ModelPackage {
                 //   int4 (ditBits=4, encoderBits=4, modulationBits=8): ~22 GB, quality
                 //     intact — attn/mlp int4, conditioning-critical modulation int8 (int4
                 //     there is grainy), VL-7B int4; small top-level projections + fp32 VAE
-                //     stay full precision. Load PEAK is still ~41 GB (bf16 DiT load);
-                //     pre-quantized weight hosting to cut peak toward ~16 GB resident+peak
-                //     is the tracked follow-up. 4-step DMD.
+                //     stay full precision. Quantize-after-load PEAKs at ~41 GB (bf16 load);
+                //     with quantizedDiTPath + quantizedEncoderPath (pre-quantized files) the
+                //     LOAD peak drops to ~21 GB (≈ resident, no bf16 materialized) and the
+                //     inference peak is ~29 GB (1024² activations + fp32 VAE). 4-step DMD.
                 footprints: [
                     QuantFootprint(quant: .bf16, residentBytes: 57_000_000_000),
                     QuantFootprint(quant: .int4, residentBytes: 22_000_000_000),
@@ -146,36 +160,51 @@ public final class QwenImageEditTurboPackage: ModelPackage {
     public func load() async throws {
         guard generator == nil else { return }
         let snapshot = URL(fileURLWithPath: configuration.snapshotPath)
+        // The snapshot always supplies vae/ + text_encoder/; the DiT comes either from
+        // snapshot/transformer/ (bf16) or a pre-quantized file.
+        let needsPTTransformer = configuration.quantizedDiTPath == nil
+        let requiredDir = needsPTTransformer ? "transformer" : "vae"
         guard FileManager.default.fileExists(
-            atPath: snapshot.appendingPathComponent("transformer").path)
+            atPath: snapshot.appendingPathComponent(requiredDir).path)
         else { throw QwenImageEditTurboPackageError.unreadableSnapshot(snapshot.path) }
+        if let qpath = configuration.quantizedDiTPath,
+            !FileManager.default.fileExists(atPath: qpath)
+        {
+            throw QwenImageEditTurboPackageError.unreadableSnapshot(qpath)
+        }
         let lora = URL(fileURLWithPath: configuration.loraPath)
         guard FileManager.default.fileExists(atPath: lora.path)
         else { throw QwenImageEditTurboPackageError.unreadableLoRA(lora.path) }
 
         // DiT first so its bf16 originals can free before the encoder loads (caps peak).
-        let transformer = try QwenImageEditWeights.loadDiTFromPT(
-            directory: snapshot.appendingPathComponent("transformer"), dtype: .bfloat16)
-        // Optional int4 tier: quantize the bulk attn + feed-forward Linears (the modulation
-        // linears are left full precision — they're small and quality-sensitive). Must run
-        // BEFORE apply(): quantized layers are then wrapped as QLoRALinear so the LoRA rides
-        // the quantized base. eval() materializes int4 and frees the bf16 weights now.
-        if let bits = configuration.ditBits {
-            let modBits = configuration.modulationBits
-            // Per-layer bits: attn + feed-forward at ditBits; modulation at modulationBits
-            // (higher precision, it's conditioning-critical) if requested; skip the rest.
-            quantize(model: transformer) { path, module
-                -> (groupSize: Int, bits: Int, mode: QuantizationMode)? in
-                guard module is Linear, path.contains("transformer_blocks") else { return nil }
-                if path.contains(".attn.") || path.contains("_mlp.") {
-                    return (groupSize: 64, bits: bits, mode: .affine)
+        let transformer: QwenImageTransformer2DModel
+        if let qpath = configuration.quantizedDiTPath {
+            // Pre-quantized: loads int4 straight in, NO bf16 peak.
+            transformer = try QwenImageEditWeights.loadQuantizedDiT(
+                from: URL(fileURLWithPath: qpath))
+        } else {
+            transformer = try QwenImageEditWeights.loadDiTFromPT(
+                directory: snapshot.appendingPathComponent("transformer"), dtype: .bfloat16)
+            // Optional int4 tier (quantize-after-load; peaks at the bf16 load). Must run
+            // BEFORE apply() so quantized layers are wrapped as QLoRALinear. Per-layer bits:
+            // attn + feed-forward at ditBits; modulation at modulationBits (conditioning-
+            // critical, higher precision) if requested; skip the rest. eval() materializes
+            // int4 and frees the bf16 weights now.
+            if let bits = configuration.ditBits {
+                let modBits = configuration.modulationBits
+                quantize(model: transformer) { path, module
+                    -> (groupSize: Int, bits: Int, mode: QuantizationMode)? in
+                    guard module is Linear, path.contains("transformer_blocks") else { return nil }
+                    if path.contains(".attn.") || path.contains("_mlp.") {
+                        return (groupSize: 64, bits: bits, mode: .affine)
+                    }
+                    if let mb = modBits, path.contains(".img_mod") || path.contains(".txt_mod") {
+                        return (groupSize: 64, bits: mb, mode: .affine)
+                    }
+                    return nil
                 }
-                if let mb = modBits, path.contains(".img_mod") || path.contains(".txt_mod") {
-                    return (groupSize: 64, bits: mb, mode: .affine)
-                }
-                return nil
+                eval(transformer)
             }
-            eval(transformer)
         }
         // Runtime DMD: apply Lightning in the activation path (survives bf16/int4; a fused
         // bf16 snapshot would lose it).
@@ -183,7 +212,8 @@ public final class QwenImageEditTurboPackage: ModelPackage {
             diffusersLoRA: lora, to: transformer, strength: configuration.strength)
 
         let encoder = try await QwenVLPromptEncoder.load(
-            snapshot: snapshot, bits: configuration.encoderBits)
+            snapshot: snapshot, bits: configuration.encoderBits,
+            quantizedTextModelPath: configuration.quantizedEncoderPath)
         let vae = try QwenImageEditWeights.loadVAE(
             directory: snapshot.appendingPathComponent("vae"), dtype: .float32)
         generator = QwenImageEditGenerator(
