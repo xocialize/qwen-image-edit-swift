@@ -65,9 +65,10 @@ public final class QwenVLPromptEncoder {
     /// `bits` (4/8) quantizes the VL-7B text model after load (the conditioning bulk; the
     /// small vision tower is left full precision). The model is eval'd immediately so the
     /// bf16 originals free before the caller loads the DiT — keeping the load peak down.
-    public static func load(snapshot: URL, dtype: DType = .bfloat16, bits: Int? = nil) async throws
-        -> QwenVLPromptEncoder
-    {
+    public static func load(
+        snapshot: URL, dtype: DType = .bfloat16, bits: Int? = nil,
+        quantizedTextModelPath: String? = nil
+    ) async throws -> QwenVLPromptEncoder {
         let encoderDir = snapshot.appendingPathComponent("text_encoder")
         let processorDir = snapshot.appendingPathComponent("processor")
 
@@ -89,12 +90,15 @@ public final class QwenVLPromptEncoder {
         ).filter { $0.pathExtension == "safetensors" }.sorted {
             $0.lastPathComponent < $1.lastPathComponent
         }
+        // When loading a pre-quantized text model we skip the bf16 LLM weights entirely
+        // (no bf16 peak) and only pull the small ViT from the snapshot.
+        let needBf16LLM = quantizedTextModelPath == nil
         var llm: [String: MLXArray] = [:]
         var vit: [String: MLXArray] = [:]
         for f in files {
             for (k, v) in try MLX.loadArrays(url: f) {
                 if k.hasPrefix("model.") {
-                    llm[String(k.dropFirst("model.".count))] = v.asType(dtype)
+                    if needBf16LLM { llm[String(k.dropFirst("model.".count))] = v.asType(dtype) }
                 } else if k.hasPrefix("visual.") {
                     vit[String(k.dropFirst("visual.".count))] = v.asType(dtype)
                 } else if k == "lm_head.weight" {
@@ -104,10 +108,19 @@ public final class QwenVLPromptEncoder {
                 }
             }
         }
-        try QwenImageEditWeights.verifyAndLoad(model: model, weights: llm, label: "VL-7B")
-        if let bits {
-            quantize(model: model, groupSize: 64, bits: bits)
-            eval(model)  // materialize int4 + free the bf16 originals now
+        if let qpath = quantizedTextModelPath {
+            let (qw, meta) = try MLX.loadArraysAndMetadata(url: URL(fileURLWithPath: qpath))
+            let qbits = meta["bits"].flatMap(Int.init) ?? 4
+            let qgs = meta["group_size"].flatMap(Int.init) ?? 64
+            quantize(model: model, groupSize: qgs, bits: qbits)  // structure only; placeholders lazy
+            try QwenImageEditWeights.verifyAndLoad(
+                model: model, weights: qw, label: "VL-7B(int\(qbits))")
+        } else {
+            try QwenImageEditWeights.verifyAndLoad(model: model, weights: llm, label: "VL-7B")
+            if let bits {
+                quantize(model: model, groupSize: 64, bits: bits)
+                eval(model)  // materialize int4 + free the bf16 originals now
+            }
         }
 
         // --- vision tower ---
@@ -131,6 +144,38 @@ public final class QwenVLPromptEncoder {
         return try QwenVLPromptEncoder(
             model: model, vision: vision, tokenizer: tokenizer,
             minPixels: processor.minPixels, maxPixels: processor.maxPixels, dtype: dtype)
+    }
+
+    /// One-time conversion: quantize the VL-7B text model and save it as a self-describing
+    /// safetensors. Consumers then pass it to `load(quantizedTextModelPath:)` to skip the
+    /// bf16 LLM load (and its peak). The small ViT still comes bf16 from the snapshot.
+    public static func saveQuantizedTextModel(
+        snapshot: URL, to outURL: URL, bits: Int = 4, groupSize: Int = 64
+    ) throws {
+        let encoderDir = snapshot.appendingPathComponent("text_encoder")
+        let configData = try Data(contentsOf: encoderDir.appendingPathComponent("config.json"))
+        var configJSON = try JSONSerialization.jsonObject(with: configData) as! [String: Any]
+        configJSON["tie_word_embeddings"] = true
+        let textConfig = try JSONDecoder().decode(
+            Qwen25VLTextConfig.self, from: JSONSerialization.data(withJSONObject: configJSON))
+        let model = Qwen25VLModel(textConfig)
+
+        let files = try FileManager.default.contentsOfDirectory(
+            at: encoderDir, includingPropertiesForKeys: nil
+        ).filter { $0.pathExtension == "safetensors" }
+        var llm: [String: MLXArray] = [:]
+        for f in files {
+            for (k, v) in try MLX.loadArrays(url: f) where k.hasPrefix("model.") {
+                llm[String(k.dropFirst("model.".count))] = v.asType(.bfloat16)
+            }
+        }
+        try QwenImageEditWeights.verifyAndLoad(model: model, weights: llm, label: "VL-7B")
+        quantize(model: model, groupSize: groupSize, bits: bits)  // default filter: Linear + Embedding
+        eval(model)
+        let params = Dictionary(uniqueKeysWithValues: model.parameters().flattened())
+        try MLX.save(
+            arrays: params,
+            metadata: ["bits": "\(bits)", "group_size": "\(groupSize)"], url: outURL)
     }
 
     /// diffusers calculate_dimensions: sqrt-area ratio-preserved, /32 (Python banker's

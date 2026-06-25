@@ -14,6 +14,8 @@ import XCTest
 final class TurboPreQuantTests: XCTestCase {
     static let quantizedDiT =
         "/Volumes/DEV_VOL1/VideoResearch/qwen-image-edit-models/qie-2511-dit-int4-mod8.safetensors"
+    static let quantizedEncoder =
+        "/Volumes/DEV_VOL1/VideoResearch/qwen-image-edit-models/qie-2511-vl7b-int4.safetensors"
 
     func testPreQuantizedLoadPeak() async throws {
         try XCTSkipUnless(
@@ -22,8 +24,11 @@ final class TurboPreQuantTests: XCTestCase {
             FileManager.default.fileExists(atPath: Self.quantizedDiT),
             "missing \(Self.quantizedDiT) — run QuantizedConvertTests first")
 
+        try XCTSkipUnless(
+            FileManager.default.fileExists(atPath: Self.quantizedEncoder),
+            "missing \(Self.quantizedEncoder) — run QuantizedConvertTests first")
         let config = QwenImageEditTurboConfiguration(
-            encoderBits: 4, quantizedDiTPath: Self.quantizedDiT)
+            quantizedDiTPath: Self.quantizedDiT, quantizedEncoderPath: Self.quantizedEncoder)
         try XCTSkipUnless(
             FileManager.default.fileExists(atPath: config.loraPath), "missing \(config.loraPath)")
         let inputPath = "/Users/dustinnielson/Desktop/lens-t2i-package.png"
@@ -51,10 +56,10 @@ final class TurboPreQuantTests: XCTestCase {
             loadPeak, resident, peak))
 
         XCTAssertEqual(edit.image.width, 1024)
-        // No bf16 DiT peak: load peak (~34 GB) is below the ~41 GB quantize-after-load path.
-        // The remaining ceiling is the encoder's transient bf16 load (~14 GB) — pre-
-        // quantizing the encoder too (quantizedEncoderPath) drops it further.
-        XCTAssertLessThan(loadPeak, 38.0, "pre-quantized DiT load peak unexpectedly high")
+        // Pre-quantized DiT AND encoder: no bf16 weights ever materialize, so load peak
+        // should approach resident (~22 GB) — a true low-RAM tier, way under the 41 GB
+        // quantize-after-load path.
+        XCTAssertLessThan(loadPeak, 26.0, "full pre-quantized load peak unexpectedly high")
         let out = FileManager.default.homeDirectoryForCurrentUser
             .appendingPathComponent("Desktop/qie-turbo-prequant.png")
         try edit.image.data.write(to: out)

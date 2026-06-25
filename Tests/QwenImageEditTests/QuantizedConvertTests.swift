@@ -19,6 +19,12 @@ final class QuantizedConvertTests: XCTestCase {
         fileURLWithPath:
             "/Volumes/DEV_VOL1/VideoResearch/qwen-image-edit-models/"
             + "qie-2511-dit-int4-mod8.safetensors")
+    static let snapshot = URL(
+        fileURLWithPath:
+            "/Volumes/DEV_VOL1/VideoResearch/qwen-image-edit-models/Qwen-Image-Edit-2511")
+    static let encURL = URL(
+        fileURLWithPath:
+            "/Volumes/DEV_VOL1/VideoResearch/qwen-image-edit-models/qie-2511-vl7b-int4.safetensors")
 
     func testConvert() throws {
         try XCTSkipUnless(
@@ -40,5 +46,27 @@ final class QuantizedConvertTests: XCTestCase {
             + "(\(bytes.map { String($0 / 1_000_000) } ?? "?") MB) "
             + "in \(String(format: "%.0f", Date().timeIntervalSince(t)))s")
         XCTAssertTrue(FileManager.default.fileExists(atPath: Self.outURL.path))
+    }
+
+    func testConvertEncoder() throws {
+        try XCTSkipUnless(
+            ProcessInfo.processInfo.environment["QIE_CONVERT"] == "1", "QIE_CONVERT=1")
+        try XCTSkipUnless(
+            FileManager.default.fileExists(
+                atPath: Self.snapshot.appendingPathComponent("text_encoder").path),
+            "missing text_encoder")
+        if FileManager.default.fileExists(atPath: Self.encURL.path) {
+            print("[convert] encoder already exists -> \(Self.encURL.path)")
+            return
+        }
+        let t = Date()
+        try QwenVLPromptEncoder.saveQuantizedTextModel(
+            snapshot: Self.snapshot, to: Self.encURL, bits: 4)
+        let bytes = (try? FileManager.default.attributesOfItem(
+            atPath: Self.encURL.path)[.size] as? Int) ?? nil
+        print("[convert] wrote \(Self.encURL.path) "
+            + "(\(bytes.map { String($0 / 1_000_000) } ?? "?") MB) "
+            + "in \(String(format: "%.0f", Date().timeIntervalSince(t)))s")
+        XCTAssertTrue(FileManager.default.fileExists(atPath: Self.encURL.path))
     }
 }
