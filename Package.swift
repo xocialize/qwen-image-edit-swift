@@ -19,6 +19,9 @@ let package = Package(
         // TeleStyleV2: content+style transfer (imageEdit + styleTransfer mode), fused
         // style + Lightning-4step LoRAs on the same QwenImageEdit core.
         .library(name: "MLXTeleStyle", targets: ["MLXTeleStyle"]),
+        // Fast/low-step tier: Lightning 4-step DMD LoRA applied at runtime (imageEdit +
+        // turbo mode) on the same QwenImageEdit core.
+        .library(name: "MLXQwenImageEditTurbo", targets: ["MLXQwenImageEditTurbo"]),
     ],
     dependencies: [
         .package(url: "https://github.com/ml-explore/mlx-swift.git", from: "0.30.0"),
@@ -61,6 +64,14 @@ let package = Package(
             ],
             path: "Sources/MLXTeleStyle"
         ),
+        .target(
+            name: "MLXQwenImageEditTurbo",
+            dependencies: [
+                "QwenImageEdit",
+                .product(name: "MLXToolKit", package: "mlx-engine-swift"),
+            ],
+            path: "Sources/MLXQwenImageEditTurbo"
+        ),
         .testTarget(
             name: "QwenImageEditTests",
             dependencies: ["QwenImageEdit"],
@@ -75,6 +86,11 @@ let package = Package(
             name: "MLXTeleStyleTests",
             dependencies: ["MLXTeleStyle"],
             path: "Tests/MLXTeleStyleTests"
+        ),
+        .testTarget(
+            name: "MLXQwenImageEditTurboTests",
+            dependencies: ["MLXQwenImageEditTurbo"],
+            path: "Tests/MLXQwenImageEditTurboTests"
         ),
     ]
 )
