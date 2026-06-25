@@ -38,6 +38,14 @@ public struct QwenImageEditTurboConfiguration: PackageConfiguration, ModelStorab
     /// applying the LoRA (nil = bf16). 4 ≈ a ~4× smaller DiT; the LoRA rides the
     /// quantized base as QLoRALinear (its low-rank factors stay full precision).
     public var ditBits: Int?
+    /// Quantize the VL-7B conditioning model to this bit width (nil = bf16). The biggest
+    /// single non-DiT resident win toward the int4 tier.
+    public var encoderBits: Int?
+    /// Quantize the DiT modulation linears (img_mod/txt_mod) at this bit width (nil = keep
+    /// full precision). They're the largest remaining bf16 chunk (~11 GB) but drive AdaLN
+    /// conditioning: int4 here visibly degrades quality (graininess), so int8 is the safer
+    /// footprint/quality tradeoff.
+    public var modulationBits: Int?
     public var defaultSteps: Int
     public var defaultTrueCFGScale: Float
     public var modelsRootDirectory: URL?
@@ -50,6 +58,8 @@ public struct QwenImageEditTurboConfiguration: PackageConfiguration, ModelStorab
             + "QIE-2511-Lightning-4steps-V1.0-bf16.safetensors",
         strength: Float = 4.0,
         ditBits: Int? = nil,
+        encoderBits: Int? = nil,
+        modulationBits: Int? = nil,
         defaultSteps: Int = 4,
         defaultTrueCFGScale: Float = 1.0,
         modelsRootDirectory: URL? = nil
@@ -58,13 +68,16 @@ public struct QwenImageEditTurboConfiguration: PackageConfiguration, ModelStorab
         self.loraPath = loraPath
         self.strength = strength
         self.ditBits = ditBits
+        self.encoderBits = encoderBits
+        self.modulationBits = modulationBits
         self.defaultSteps = defaultSteps
         self.defaultTrueCFGScale = defaultTrueCFGScale
         self.modelsRootDirectory = modelsRootDirectory
     }
 
     private enum CodingKeys: String, CodingKey {
-        case snapshotPath, loraPath, strength, ditBits, defaultSteps, defaultTrueCFGScale
+        case snapshotPath, loraPath, strength, ditBits, encoderBits, modulationBits
+        case defaultSteps, defaultTrueCFGScale
     }
 }
 
@@ -94,14 +107,17 @@ public final class QwenImageEditTurboPackage: ModelPackage {
             provenance: Provenance(
                 sourceRepo: "lightx2v/Qwen-Image-Edit-2511-Lightning", revision: "main", tier: 1),
             requirements: RequirementsManifest(
-                // bf16: ~57 GB resident (20B DiT + bf16 VL-7B + fp32 VAE; runtime LoRA adds
-                // only rank factors). int4 (ditBits=4): the DiT attn+mlp Linears quantized
-                // -> ~38 GB resident measured (DiT only; VL-7B + VAE still full precision).
-                // Full int4 (encoder + pre-quantized load to cut the bf16 peak) ~16 GB is
-                // the tracked follow-up. 4-step DMD.
+                // Measured resident (1024², runtime LoRA adds only rank factors):
+                //   bf16: ~57 GB (20B DiT + bf16 VL-7B + fp32 VAE).
+                //   int4 (ditBits=4, encoderBits=4, modulationBits=8): ~22 GB, quality
+                //     intact — attn/mlp int4, conditioning-critical modulation int8 (int4
+                //     there is grainy), VL-7B int4; small top-level projections + fp32 VAE
+                //     stay full precision. Load PEAK is still ~41 GB (bf16 DiT load);
+                //     pre-quantized weight hosting to cut peak toward ~16 GB resident+peak
+                //     is the tracked follow-up. 4-step DMD.
                 footprints: [
                     QuantFootprint(quant: .bf16, residentBytes: 57_000_000_000),
-                    QuantFootprint(quant: .int4, residentBytes: 38_000_000_000),
+                    QuantFootprint(quant: .int4, residentBytes: 22_000_000_000),
                 ],
                 requiredBackends: [.metalGPU],
                 os: OSRequirement(minMacOS: SemanticVersion(major: 26, minor: 0, patch: 0)),
@@ -137,23 +153,37 @@ public final class QwenImageEditTurboPackage: ModelPackage {
         guard FileManager.default.fileExists(atPath: lora.path)
         else { throw QwenImageEditTurboPackageError.unreadableLoRA(lora.path) }
 
-        let encoder = try await QwenVLPromptEncoder.load(snapshot: snapshot)
+        // DiT first so its bf16 originals can free before the encoder loads (caps peak).
         let transformer = try QwenImageEditWeights.loadDiTFromPT(
             directory: snapshot.appendingPathComponent("transformer"), dtype: .bfloat16)
         // Optional int4 tier: quantize the bulk attn + feed-forward Linears (the modulation
         // linears are left full precision — they're small and quality-sensitive). Must run
         // BEFORE apply(): quantized layers are then wrapped as QLoRALinear so the LoRA rides
-        // the quantized base.
+        // the quantized base. eval() materializes int4 and frees the bf16 weights now.
         if let bits = configuration.ditBits {
-            quantize(model: transformer, groupSize: 64, bits: bits) { path, module in
-                module is Linear && path.contains("transformer_blocks")
-                    && (path.contains(".attn.") || path.contains("_mlp."))
+            let modBits = configuration.modulationBits
+            // Per-layer bits: attn + feed-forward at ditBits; modulation at modulationBits
+            // (higher precision, it's conditioning-critical) if requested; skip the rest.
+            quantize(model: transformer) { path, module
+                -> (groupSize: Int, bits: Int, mode: QuantizationMode)? in
+                guard module is Linear, path.contains("transformer_blocks") else { return nil }
+                if path.contains(".attn.") || path.contains("_mlp.") {
+                    return (groupSize: 64, bits: bits, mode: .affine)
+                }
+                if let mb = modBits, path.contains(".img_mod") || path.contains(".txt_mod") {
+                    return (groupSize: 64, bits: mb, mode: .affine)
+                }
+                return nil
             }
+            eval(transformer)
         }
-        // Runtime DMD: apply Lightning in the activation path (survives bf16; a fused
+        // Runtime DMD: apply Lightning in the activation path (survives bf16/int4; a fused
         // bf16 snapshot would lose it).
         try QwenImageEditLoRA.apply(
             diffusersLoRA: lora, to: transformer, strength: configuration.strength)
+
+        let encoder = try await QwenVLPromptEncoder.load(
+            snapshot: snapshot, bits: configuration.encoderBits)
         let vae = try QwenImageEditWeights.loadVAE(
             directory: snapshot.appendingPathComponent("vae"), dtype: .float32)
         generator = QwenImageEditGenerator(

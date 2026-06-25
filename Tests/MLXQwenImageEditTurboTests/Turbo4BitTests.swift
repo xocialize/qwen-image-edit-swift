@@ -15,7 +15,8 @@ final class Turbo4BitTests: XCTestCase {
     func testInt4LoadAndEdit() async throws {
         try XCTSkipUnless(
             ProcessInfo.processInfo.environment["QIE_TURBO_4BIT"] == "1", "QIE_TURBO_4BIT=1")
-        let config = QwenImageEditTurboConfiguration(ditBits: 4)
+        let config = QwenImageEditTurboConfiguration(
+            ditBits: 4, encoderBits: 4, modulationBits: 8)
         for p in [config.snapshotPath, config.loraPath] {
             try XCTSkipUnless(FileManager.default.fileExists(atPath: p), "missing \(p)")
         }
@@ -45,9 +46,10 @@ final class Turbo4BitTests: XCTestCase {
             resident, peak))
 
         XCTAssertEqual(edit.image.width, 1024)
-        // int4 DiT must be well under the ~57 GB bf16 tier (DiT ~40 GB bf16 -> ~10 GB int4;
-        // encoder stays bf16 in this first cut, so expect ~mid-20s GB resident).
-        XCTAssertLessThan(resident, 40.0, "int4 resident unexpectedly high")
+        // Mixed: attn+mlp int4, modulation int8, encoder int4. Between the 28 GB
+        // (mod full-precision) and 18 GB (mod int4) points; int8 mod trades some footprint
+        // for quality.
+        XCTAssertLessThan(resident, 26.0, "mixed int4/int8 resident unexpectedly high")
         let out = FileManager.default.homeDirectoryForCurrentUser
             .appendingPathComponent("Desktop/qie-turbo-int4.png")
         try edit.image.data.write(to: out)
