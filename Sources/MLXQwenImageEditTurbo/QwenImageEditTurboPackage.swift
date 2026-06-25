@@ -50,6 +50,11 @@ public struct QwenImageEditTurboConfiguration: PackageConfiguration, ModelStorab
     /// When set, the DiT loads straight as int4 with NO bf16 peak — `ditBits`/`modulationBits`
     /// are then read from the file's metadata and ignored here. This is what makes a true
     /// low-RAM load possible (vs quantize-after-bf16-load, which peaks at ~40 GB).
+    ///
+    /// Pre-built files (DiT + encoder) are hosted at
+    /// `xocialize/qwen-image-edit-2511-mlx-int4` (engine-specific format; not standard
+    /// mlx-loadable). qie-2511-dit-int4-mod8.safetensors here; the encoder counterpart
+    /// goes to `quantizedEncoderPath`.
     public var quantizedDiTPath: String?
     /// Path to a pre-quantized VL-7B text model (from `QwenVLPromptEncoder.saveQuantizedTextModel`).
     /// When set, the encoder loads its LLM straight as int4 — removing the bf16 encoder load
