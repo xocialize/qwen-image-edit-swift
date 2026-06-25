@@ -28,7 +28,8 @@ final class TurboPreQuantTests: XCTestCase {
             FileManager.default.fileExists(atPath: Self.quantizedEncoder),
             "missing \(Self.quantizedEncoder) — run QuantizedConvertTests first")
         let config = QwenImageEditTurboConfiguration(
-            quantizedDiTPath: Self.quantizedDiT, quantizedEncoderPath: Self.quantizedEncoder)
+            quantizedDiTPath: Self.quantizedDiT, quantizedEncoderPath: Self.quantizedEncoder,
+            lowPrecisionVAE: true)
         try XCTSkipUnless(
             FileManager.default.fileExists(atPath: config.loraPath), "missing \(config.loraPath)")
         let inputPath = "/Users/dustinnielson/Desktop/lens-t2i-package.png"
@@ -60,6 +61,9 @@ final class TurboPreQuantTests: XCTestCase {
         // should approach resident (~22 GB) — a true low-RAM tier, way under the 41 GB
         // quantize-after-load path.
         XCTAssertLessThan(loadPeak, 26.0, "full pre-quantized load peak unexpectedly high")
+        // bf16 VAE keeps the 1024² decode intermediates small -> inference peak well under
+        // the ~29 GB fp32-VAE path.
+        XCTAssertLessThan(peak, 27.0, "inference peak unexpectedly high")
         let out = FileManager.default.homeDirectoryForCurrentUser
             .appendingPathComponent("Desktop/qie-turbo-prequant.png")
         try edit.image.data.write(to: out)

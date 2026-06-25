@@ -78,6 +78,7 @@ public enum QwenImageEditWeights {
             state[k] = v.asType(dtype)
         }
         try verifyAndLoad(model: vae, weights: state, label: "VAE")
+        vae.weightDtype = dtype
         return vae
     }
 
