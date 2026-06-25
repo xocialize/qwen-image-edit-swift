@@ -16,6 +16,7 @@ import CoreGraphics
 import Foundation
 import ImageIO
 import MLX
+import MLXNN
 import MLXToolKit
 import QwenImageEdit
 import UniformTypeIdentifiers
@@ -29,8 +30,14 @@ public struct QwenImageEditTurboConfiguration: PackageConfiguration, ModelStorab
     public var snapshotPath: String
     /// Diffusers-format Lightning 4-step LoRA (.safetensors), applied at load.
     public var loraPath: String
-    /// LoRA strength multiplier on alpha/rank. 1.0 = the documented diffusers default.
+    /// LoRA strength multiplier on alpha/rank. 1.0 = the documented diffusers default, but
+    /// the Lightning DMD is under-applied there in our pipeline; ~4 (0.5 effective) fully
+    /// engages the 4-step distillation (strength eval) — hence the default below.
     public var strength: Float
+    /// Quantize the DiT's attention + feed-forward Linears to this bit width before
+    /// applying the LoRA (nil = bf16). 4 ≈ a ~4× smaller DiT; the LoRA rides the
+    /// quantized base as QLoRALinear (its low-rank factors stay full precision).
+    public var ditBits: Int?
     public var defaultSteps: Int
     public var defaultTrueCFGScale: Float
     public var modelsRootDirectory: URL?
@@ -41,7 +48,8 @@ public struct QwenImageEditTurboConfiguration: PackageConfiguration, ModelStorab
         loraPath: String =
             "/Users/dustinnielson/Development/telestyle-work/loras/"
             + "QIE-2511-Lightning-4steps-V1.0-bf16.safetensors",
-        strength: Float = 1.0,
+        strength: Float = 4.0,
+        ditBits: Int? = nil,
         defaultSteps: Int = 4,
         defaultTrueCFGScale: Float = 1.0,
         modelsRootDirectory: URL? = nil
@@ -49,13 +57,14 @@ public struct QwenImageEditTurboConfiguration: PackageConfiguration, ModelStorab
         self.snapshotPath = snapshotPath
         self.loraPath = loraPath
         self.strength = strength
+        self.ditBits = ditBits
         self.defaultSteps = defaultSteps
         self.defaultTrueCFGScale = defaultTrueCFGScale
         self.modelsRootDirectory = modelsRootDirectory
     }
 
     private enum CodingKeys: String, CodingKey {
-        case snapshotPath, loraPath, strength, defaultSteps, defaultTrueCFGScale
+        case snapshotPath, loraPath, strength, ditBits, defaultSteps, defaultTrueCFGScale
     }
 }
 
@@ -85,9 +94,15 @@ public final class QwenImageEditTurboPackage: ModelPackage {
             provenance: Provenance(
                 sourceRepo: "lightx2v/Qwen-Image-Edit-2511-Lightning", revision: "main", tier: 1),
             requirements: RequirementsManifest(
-                // Same footprint as the base (runtime LoRA adds only rank-64 factors):
-                // ~60 GB resident bf16 (20B DiT + bf16 VL-7B + fp32 VAE). 4-step DMD.
-                footprints: [QuantFootprint(quant: .bf16, residentBytes: 60_000_000_000)],
+                // bf16: ~57 GB resident (20B DiT + bf16 VL-7B + fp32 VAE; runtime LoRA adds
+                // only rank factors). int4 (ditBits=4): the DiT attn+mlp Linears quantized
+                // -> ~38 GB resident measured (DiT only; VL-7B + VAE still full precision).
+                // Full int4 (encoder + pre-quantized load to cut the bf16 peak) ~16 GB is
+                // the tracked follow-up. 4-step DMD.
+                footprints: [
+                    QuantFootprint(quant: .bf16, residentBytes: 57_000_000_000),
+                    QuantFootprint(quant: .int4, residentBytes: 38_000_000_000),
+                ],
                 requiredBackends: [.metalGPU],
                 os: OSRequirement(minMacOS: SemanticVersion(major: 26, minor: 0, patch: 0)),
                 chipFloor: .max
@@ -125,6 +140,16 @@ public final class QwenImageEditTurboPackage: ModelPackage {
         let encoder = try await QwenVLPromptEncoder.load(snapshot: snapshot)
         let transformer = try QwenImageEditWeights.loadDiTFromPT(
             directory: snapshot.appendingPathComponent("transformer"), dtype: .bfloat16)
+        // Optional int4 tier: quantize the bulk attn + feed-forward Linears (the modulation
+        // linears are left full precision — they're small and quality-sensitive). Must run
+        // BEFORE apply(): quantized layers are then wrapped as QLoRALinear so the LoRA rides
+        // the quantized base.
+        if let bits = configuration.ditBits {
+            quantize(model: transformer, groupSize: 64, bits: bits) { path, module in
+                module is Linear && path.contains("transformer_blocks")
+                    && (path.contains(".attn.") || path.contains("_mlp."))
+            }
+        }
         // Runtime DMD: apply Lightning in the activation path (survives bf16; a fused
         // bf16 snapshot would lose it).
         try QwenImageEditLoRA.apply(
