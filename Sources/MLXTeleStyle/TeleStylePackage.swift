@@ -52,7 +52,11 @@ public struct TeleStyleConfiguration: PackageConfiguration, ModelStorable {
             + "QIE-2511-Lightning-4steps-V1.0-bf16.safetensors",
         styleStrength: Float = 1.0,
         lightningStrength: Float = 1.0,
-        defaultSteps: Int = 4,
+        // Step eval (content_1/style_1): 4 steps is soft/hazy for a full restyle, 8 is
+        // defined, 16 is crisp flat-illustration (~the reference). 8 balances quality vs
+        // cost; bump toward 16 for maximum crispness. (Local edits like the turbo tier are
+        // fine at 4 — global restyle needs more.)
+        defaultSteps: Int = 8,
         defaultTrueCFGScale: Float = 1.0,
         modelsRootDirectory: URL? = nil
     ) {
