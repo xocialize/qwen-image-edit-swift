@@ -55,6 +55,10 @@ public struct QwenImageEditTurboConfiguration: PackageConfiguration, ModelStorab
     /// When set, the encoder loads its LLM straight as int4 — removing the bf16 encoder load
     /// that is the peak ceiling once the DiT is pre-quantized.
     public var quantizedEncoderPath: String?
+    /// Load the VAE in bf16 instead of fp32 (halves the VAE weights and its 1024² decode
+    /// intermediates — the largest inference-peak contributor once weights are int4). bf16
+    /// (not fp16) keeps dynamic range. Off by default (the port's VAE parity is fp32).
+    public var lowPrecisionVAE: Bool
     public var defaultSteps: Int
     public var defaultTrueCFGScale: Float
     public var modelsRootDirectory: URL?
@@ -71,6 +75,7 @@ public struct QwenImageEditTurboConfiguration: PackageConfiguration, ModelStorab
         modulationBits: Int? = nil,
         quantizedDiTPath: String? = nil,
         quantizedEncoderPath: String? = nil,
+        lowPrecisionVAE: Bool = false,
         defaultSteps: Int = 4,
         defaultTrueCFGScale: Float = 1.0,
         modelsRootDirectory: URL? = nil
@@ -83,6 +88,7 @@ public struct QwenImageEditTurboConfiguration: PackageConfiguration, ModelStorab
         self.modulationBits = modulationBits
         self.quantizedDiTPath = quantizedDiTPath
         self.quantizedEncoderPath = quantizedEncoderPath
+        self.lowPrecisionVAE = lowPrecisionVAE
         self.defaultSteps = defaultSteps
         self.defaultTrueCFGScale = defaultTrueCFGScale
         self.modelsRootDirectory = modelsRootDirectory
@@ -90,7 +96,8 @@ public struct QwenImageEditTurboConfiguration: PackageConfiguration, ModelStorab
 
     private enum CodingKeys: String, CodingKey {
         case snapshotPath, loraPath, strength, ditBits, encoderBits, modulationBits
-        case quantizedDiTPath, quantizedEncoderPath, defaultSteps, defaultTrueCFGScale
+        case quantizedDiTPath, quantizedEncoderPath, lowPrecisionVAE
+        case defaultSteps, defaultTrueCFGScale
     }
 }
 
@@ -127,8 +134,8 @@ public final class QwenImageEditTurboPackage: ModelPackage {
                 //     there is grainy), VL-7B int4; small top-level projections + fp32 VAE
                 //     stay full precision. Quantize-after-load PEAKs at ~41 GB (bf16 load);
                 //     with quantizedDiTPath + quantizedEncoderPath (pre-quantized files) the
-                //     LOAD peak drops to ~21 GB (≈ resident, no bf16 materialized) and the
-                //     inference peak is ~29 GB (1024² activations + fp32 VAE). 4-step DMD.
+                //     LOAD peak drops to ~21 GB (≈ resident, no bf16 materialized); inference
+                //     peak ~29 GB, or ~25.5 GB with lowPrecisionVAE (bf16 VAE). 4-step DMD.
                 footprints: [
                     QuantFootprint(quant: .bf16, residentBytes: 57_000_000_000),
                     QuantFootprint(quant: .int4, residentBytes: 22_000_000_000),
@@ -215,7 +222,8 @@ public final class QwenImageEditTurboPackage: ModelPackage {
             snapshot: snapshot, bits: configuration.encoderBits,
             quantizedTextModelPath: configuration.quantizedEncoderPath)
         let vae = try QwenImageEditWeights.loadVAE(
-            directory: snapshot.appendingPathComponent("vae"), dtype: .float32)
+            directory: snapshot.appendingPathComponent("vae"),
+            dtype: configuration.lowPrecisionVAE ? .bfloat16 : .float32)
         generator = QwenImageEditGenerator(
             encoder: encoder, transformer: transformer, vae: vae)
     }

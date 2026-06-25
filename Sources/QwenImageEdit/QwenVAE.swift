@@ -251,6 +251,11 @@ public final class QwenImageVAE: Module {
     @ModuleInfo(key: "decoder") var decoder: QwenImageVAEDecoder
     @ModuleInfo(key: "encoder") var encoder: QwenImageVAEEncoder
 
+    /// Compute dtype of the loaded weights (set by `loadVAE`). decode/encode cast their
+    /// input to this so a bf16 VAE runs the whole 1024² decode in bf16 (half the
+    /// intermediates); defaults to fp32, the parity-locked regime.
+    public var weightDtype: DType = .float32
+
     /// From vae/config.json (latents_mean / latents_std).
     public static let latentsMean: [Float] = [
         -0.7571, -0.7089, -0.9113, 0.1075, -0.1745, 0.9653, -0.1517, 1.5508,
@@ -273,7 +278,7 @@ public final class QwenImageVAE: Module {
 
     /// latents: (B, 16, T, H, W) de-normalized -> image (B, 3, T, 8H, 8W).
     public func decode(_ latents: MLXArray) -> MLXArray {
-        var x = latents.transposed(0, 2, 3, 4, 1)  // -> (B, T, H, W, C)
+        var x = latents.asType(weightDtype).transposed(0, 2, 3, 4, 1)  // -> (B, T, H, W, C)
         x = postQuantConv(x)
         x = decoder(x)
         return x.transposed(0, 4, 1, 2, 3)  // -> (B, C, T, H, W)
