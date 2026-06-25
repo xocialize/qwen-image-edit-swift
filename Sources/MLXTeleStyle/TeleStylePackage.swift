@@ -51,12 +51,13 @@ public struct TeleStyleConfiguration: PackageConfiguration, ModelStorable {
             "/Users/dustinnielson/Development/telestyle-work/loras/"
             + "QIE-2511-Lightning-4steps-V1.0-bf16.safetensors",
         styleStrength: Float = 1.0,
-        lightningStrength: Float = 1.0,
-        // Step eval (content_1/style_1): 4 steps is soft/hazy for a full restyle, 8 is
-        // defined, 16 is crisp flat-illustration (~the reference). 8 balances quality vs
-        // cost; bump toward 16 for maximum crispness. (Local edits like the turbo tier are
-        // fine at 4 — global restyle needs more.)
-        defaultSteps: Int = 8,
+        // Strength eval (content_1/style_1, 4 steps): the Lightning DMD is UNDER-applied at
+        // the diffusers default (1.0 = 0.125 effective) — output stays soft, like style-
+        // only. At ~4 (0.5 effective) the DMD fully engages and 4-step output is crisp
+        // flat-illustration (matching the 16-step@1.0 reference, at a quarter the steps).
+        // So strength — not step count — was the real lever; default 4.0 + 4 steps.
+        lightningStrength: Float = 4.0,
+        defaultSteps: Int = 4,
         defaultTrueCFGScale: Float = 1.0,
         modelsRootDirectory: URL? = nil
     ) {
