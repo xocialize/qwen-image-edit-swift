@@ -35,6 +35,10 @@ final class LoRAFuseTests: XCTestCase {
             "/Users/dustinnielson/Development/telestyle-work/loras/"
             + "QIE-2511-Lightning-4steps-V1.0-bf16.safetensors")
     static let deltaRef = URL(fileURLWithPath: "/tmp/lora_fuse_delta_ref.safetensors")
+    static let styleLoRA = URL(
+        fileURLWithPath:
+            "/Users/dustinnielson/Development/telestyle-work/loras/"
+            + "diffusers-TeleStyleV2-QIE-2511-Lora-bf16.safetensors")
 
     private static let sampled = [
         "transformer_blocks.0.attn.to_q",
@@ -56,7 +60,8 @@ final class LoRAFuseTests: XCTestCase {
             try XCTSkipUnless(
                 FileManager.default.fileExists(atPath: url.path), "missing \(url.path)")
         }
-        let (params, _) = try QwenImageEditLoRA.parameters(from: Self.loraURL, dtype: .float32)
+        let (params, _, _) = try QwenImageEditLoRA.combined(
+            [(Self.loraURL, 1.0)], dtype: .float32)
         let ref = try MLX.loadArrays(url: Self.deltaRef)
 
         for name in Self.sampled {
@@ -79,6 +84,38 @@ final class LoRAFuseTests: XCTestCase {
             print("[fp32] \(name): rel-fro \(rel)")
             XCTAssertLessThan(rel, 1e-3, "\(name) fp32 fuse must match PyTorch reference")
         }
+    }
+
+    func testMultiLoRARankStacking() throws {
+        try XCTSkipUnless(
+            ProcessInfo.processInfo.environment["QIE_LORA"] == "1", "QIE_LORA=1")
+        for url in [Self.loraURL, Self.styleLoRA] {
+            try XCTSkipUnless(
+                FileManager.default.fileExists(atPath: url.path), "missing \(url.path)")
+        }
+        // Style adapter (different dialect: `transformer.` prefix, no alpha, img_mod
+        // targets) must parse, and at scale 1.0 (alpha-less default).
+        let fStyle = try QwenImageEditLoRA.factors(from: Self.styleLoRA, dtype: .float32, strength: 1.0)
+        XCTAssertNotNil(fStyle["transformer_blocks.0.img_mod"], "style img_mod target missing")
+        XCTAssertNotNil(fStyle["transformer_blocks.0.img_mlp.proj_out"], "style proj_out missing")
+
+        // Rank-stacking: combined delta on a layer BOTH adapters touch must equal the sum
+        // of the two individual deltas. delta = bᵀ·aᵀ for our [in,rank]/[rank,out] factors.
+        let fLight = try QwenImageEditLoRA.factors(from: Self.loraURL, dtype: .float32, strength: 1.0)
+        let base = "transformer_blocks.0.attn.to_q"
+        let l = fLight[base]!
+        let s = fStyle[base]!
+        let deltaSum = matmul(l.b.T, l.a.T) + matmul(s.b.T, s.a.T)
+
+        let (params, ranks, _) = try QwenImageEditLoRA.combined(
+            [(Self.loraURL, 1.0), (Self.styleLoRA, 1.0)], dtype: .float32)
+        XCTAssertEqual(ranks[base], l.a.dim(1) + s.a.dim(1), "combined rank = r_light + r_style")
+        let aCat = params[base + ".lora_a"]!
+        let bCat = params[base + ".lora_b"]!
+        let deltaCombined = matmul(bCat.T, aCat.T)
+
+        XCTAssertLessThan(relFro(deltaCombined, deltaSum), 1e-5,
+            "rank-stacked delta must equal the sum of the individual LoRA deltas")
     }
 
     func testBf16FusionIsLossy() throws {

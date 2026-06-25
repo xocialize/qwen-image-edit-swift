@@ -32,8 +32,8 @@ final class LoRARemapTests: XCTestCase {
             FileManager.default.fileExists(atPath: Self.loraURL.path),
             "Lightning LoRA not present at \(Self.loraURL.path)")
 
-        let (params, targetKeys) = try QwenImageEditLoRA.parameters(
-            from: Self.loraURL, dtype: .bfloat16)
+        let (params, _, targetKeys) = try QwenImageEditLoRA.combined(
+            [(Self.loraURL, 1.0)], dtype: .bfloat16)
 
         // 60 blocks x 12 Linears x {lora_a, lora_b} = 1440 parameter tensors.
         XCTAssertEqual(params.count, 1440, "expected 1440 lora_a/lora_b tensors")

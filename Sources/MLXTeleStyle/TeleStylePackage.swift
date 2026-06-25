@@ -1,10 +1,14 @@
 // MLXEngine package for TeleStyleV2 — content-preserving image style transfer.
 //
-// TeleStyleV2 (Apache-2.0, Tele-AI) is the QwenImageEdit-2511 base with two LoRAs
-// fused at scale 1.0: the TeleStyleV2 style LoRA + the QIE-2511 Lightning 4-step
-// (DMD) LoRA. It is therefore the SAME core (`QwenImageEdit`) over a different
-// (fused) snapshot — there is no architecture change, no role token: image 0 is the
-// content, image 1 the style reference, and the fused LoRA supplies the behavior.
+// TeleStyleV2 (Apache-2.0, Tele-AI) is the QwenImageEdit-2511 base with two LoRAs at
+// strength 1.0: the TeleStyleV2 style LoRA + the QIE-2511 Lightning 4-step (DMD) LoRA.
+// Both are applied at RUNTIME (QwenImageEditLoRA.apply, rank-stacked) over the base
+// transformer — NOT pre-fused. Fusing into a bf16 snapshot rounds the DMD LoRA away
+// (its per-weight deltas sit below bf16 ULP), which silently broke the 4-step behavior;
+// runtime application adds each adapter's low-rank term in the activation path, where it
+// survives bf16. (This retires the external Python merge + the fused TeleStyleV2-2511
+// snapshot.) Same core (`QwenImageEdit`), no architecture change, no role token: image 0
+// is the content, image 1 the style reference; the LoRAs supply the behavior.
 //
 // Surface: the canonical `imageEdit` capability with a `styleTransfer` mode tag
 // (per C4 — one multi-image editor, the tag declares intent; not a new capability).
@@ -22,42 +26,63 @@ import UniformTypeIdentifiers
 /// in mlx-engine-swift ≥ next tag; used as a literal here for the current pinned tag).
 public let styleTransferMode = Mode(rawValue: "styleTransfer")
 
-/// Init-time configuration (C9): the fused TeleStyleV2-2511 snapshot + DMD defaults.
+/// Init-time configuration (C9): the BASE 2511 snapshot + the two LoRAs + DMD defaults.
 public struct TeleStyleConfiguration: PackageConfiguration, ModelStorable {
-    /// Snapshot root with the FUSED `transformer/` + base `vae/`, `text_encoder/`,
-    /// `processor/` (the merge tool produces this layout).
-    public var snapshotPath: String
+    /// Base 2511 snapshot root with `transformer/`, `vae/`, `text_encoder/`, `processor/`.
+    public var basePath: String
+    /// Diffusers-format TeleStyleV2 style LoRA (.safetensors).
+    public var styleLoRAPath: String
+    /// Diffusers-format Lightning 4-step DMD LoRA (.safetensors).
+    public var lightningLoRAPath: String
+    /// Per-adapter strength multipliers (1.0 = the merge's `set_adapters(..., 1.0)`).
+    public var styleStrength: Float
+    public var lightningStrength: Float
     public var defaultSteps: Int
     public var defaultTrueCFGScale: Float
     public var modelsRootDirectory: URL?
 
     public init(
-        snapshotPath: String =
-            "/Volumes/DEV_VOL1/VideoResearch/qwen-image-edit-models/TeleStyleV2-2511",
+        basePath: String =
+            "/Volumes/DEV_VOL1/VideoResearch/qwen-image-edit-models/Qwen-Image-Edit-2511",
+        styleLoRAPath: String =
+            "/Users/dustinnielson/Development/telestyle-work/loras/"
+            + "diffusers-TeleStyleV2-QIE-2511-Lora-bf16.safetensors",
+        lightningLoRAPath: String =
+            "/Users/dustinnielson/Development/telestyle-work/loras/"
+            + "QIE-2511-Lightning-4steps-V1.0-bf16.safetensors",
+        styleStrength: Float = 1.0,
+        lightningStrength: Float = 1.0,
         defaultSteps: Int = 4,
         defaultTrueCFGScale: Float = 1.0,
         modelsRootDirectory: URL? = nil
     ) {
-        self.snapshotPath = snapshotPath
+        self.basePath = basePath
+        self.styleLoRAPath = styleLoRAPath
+        self.lightningLoRAPath = lightningLoRAPath
+        self.styleStrength = styleStrength
+        self.lightningStrength = lightningStrength
         self.defaultSteps = defaultSteps
         self.defaultTrueCFGScale = defaultTrueCFGScale
         self.modelsRootDirectory = modelsRootDirectory
     }
 
     private enum CodingKeys: String, CodingKey {
-        case snapshotPath, defaultSteps, defaultTrueCFGScale
+        case basePath, styleLoRAPath, lightningLoRAPath
+        case styleStrength, lightningStrength, defaultSteps, defaultTrueCFGScale
     }
 }
 
 public enum TeleStylePackageError: Error, LocalizedError {
     case unreadableSnapshot(String)
+    case unreadableLoRA(String)
     case imageDecode
     case pngEncode
     case noImages
 
     public var errorDescription: String? {
         switch self {
-        case .unreadableSnapshot(let p): return "TeleStyleV2 snapshot not readable at \(p)."
+        case .unreadableSnapshot(let p): return "TeleStyleV2 base snapshot not readable at \(p)."
+        case .unreadableLoRA(let p): return "TeleStyleV2 LoRA not readable at \(p)."
         case .imageDecode: return "Could not decode an input image."
         case .pngEncode: return "PNG encoding failed."
         case .noImages: return "imageEdit/styleTransfer requires at least one image."
@@ -75,9 +100,9 @@ public final class TeleStylePackage: ModelPackage {
             provenance: Provenance(
                 sourceRepo: "Tele-AI/TeleStyleV2", revision: "main", tier: 1),
             requirements: RequirementsManifest(
-                // Same footprint as the QwenImageEdit base (fused LoRA adds no params):
-                // ~60 GB resident bf16 (20B DiT + bf16 VL-7B + fp32 VAE). 4-bit is the
-                // tracked follow-up (~16 GB). DMD tier runs 4 steps.
+                // Same footprint as the QwenImageEdit base (runtime LoRAs add only small
+                // rank factors): ~60 GB resident bf16 (20B DiT + bf16 VL-7B + fp32 VAE).
+                // 4-bit is the tracked follow-up (~16 GB). DMD tier runs 4 steps.
                 footprints: [QuantFootprint(quant: .bf16, residentBytes: 60_000_000_000)],
                 requiredBackends: [.metalGPU],
                 os: OSRequirement(minMacOS: SemanticVersion(major: 26, minor: 0, patch: 0)),
@@ -106,16 +131,29 @@ public final class TeleStylePackage: ModelPackage {
 
     public func load() async throws {
         guard generator == nil else { return }
-        let snapshot = URL(fileURLWithPath: configuration.snapshotPath)
+        let base = URL(fileURLWithPath: configuration.basePath)
         guard FileManager.default.fileExists(
-            atPath: snapshot.appendingPathComponent("transformer").path)
-        else { throw TeleStylePackageError.unreadableSnapshot(snapshot.path) }
+            atPath: base.appendingPathComponent("transformer").path)
+        else { throw TeleStylePackageError.unreadableSnapshot(base.path) }
+        let style = URL(fileURLWithPath: configuration.styleLoRAPath)
+        let lightning = URL(fileURLWithPath: configuration.lightningLoRAPath)
+        for lora in [style, lightning] where !FileManager.default.fileExists(atPath: lora.path) {
+            throw TeleStylePackageError.unreadableLoRA(lora.path)
+        }
 
-        let encoder = try await QwenVLPromptEncoder.load(snapshot: snapshot)
+        let encoder = try await QwenVLPromptEncoder.load(snapshot: base)
         let transformer = try QwenImageEditWeights.loadDiTFromPT(
-            directory: snapshot.appendingPathComponent("transformer"), dtype: .bfloat16)
+            directory: base.appendingPathComponent("transformer"), dtype: .bfloat16)
+        // Runtime, rank-stacked: style + Lightning together in the activation path (a bf16
+        // fuse would lose the DMD adapter).
+        try QwenImageEditLoRA.apply(
+            diffusersLoRAs: [
+                (style, configuration.styleStrength),
+                (lightning, configuration.lightningStrength),
+            ],
+            to: transformer)
         let vae = try QwenImageEditWeights.loadVAE(
-            directory: snapshot.appendingPathComponent("vae"), dtype: .float32)
+            directory: base.appendingPathComponent("vae"), dtype: .float32)
         generator = QwenImageEditGenerator(
             encoder: encoder, transformer: transformer, vae: vae)
     }
