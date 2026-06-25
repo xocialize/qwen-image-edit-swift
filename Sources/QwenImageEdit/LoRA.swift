@@ -85,8 +85,12 @@ public enum QwenImageEditLoRA {
 
     /// Parse a diffusers LoRA into engine-keyed `lora_a` / `lora_b` parameters (scale
     /// baked into `lora_b`) plus the set of block-relative target module paths.
+    ///
+    /// `strength` multiplies the LoRA's own `alpha/rank` scaling. 1.0 reproduces the
+    /// documented `pipe.load_lora_weights(...)` default (diffusers applies `alpha/rank`);
+    /// raise it to push the adapter harder (the user-tunable knob the runtime path enables).
     static func parameters(
-        from url: URL, dtype: DType
+        from url: URL, dtype: DType, strength: Float = 1.0
     ) throws -> (params: [String: MLXArray], targetKeys: Set<String>) {
         let raw = try MLX.loadArrays(url: url)
 
@@ -112,7 +116,7 @@ public enum QwenImageEditLoRA {
                 throw LoRAError.incompleteTriple(base)
             }
             let rank = aMat.dim(0)  // diffusers lora_A is [rank, in]
-            let scale = alphaScalar.item(Float.self) / Float(rank)
+            let scale = strength * alphaScalar.item(Float.self) / Float(rank)
             // MLX LoRALinear: y + (x @ loraA[in,rank]) @ loraB[rank,out]; bake scale in B.
             params[base + ".lora_a"] = aMat.T.asType(dtype)
             params[base + ".lora_b"] = (scale * bMat.T).asType(dtype)
@@ -128,9 +132,10 @@ public enum QwenImageEditLoRA {
     public static func apply(
         diffusersLoRA url: URL,
         to model: QwenImageTransformer2DModel,
-        dtype: DType = .bfloat16
+        dtype: DType = .bfloat16,
+        strength: Float = 1.0
     ) throws {
-        let (params, targetKeys) = try parameters(from: url, dtype: dtype)
+        let (params, targetKeys) = try parameters(from: url, dtype: dtype, strength: strength)
         replaceTargets(in: model, keys: targetKeys) { linear in
             LoRALinear.from(linear: linear, rank: 64, scale: 1.0)  // scale baked into lora_b
         }
