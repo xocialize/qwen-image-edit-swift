@@ -70,7 +70,8 @@ let package = Package(
                 "QwenImageEdit",
                 .product(name: "MLXToolKit", package: "mlx-engine-swift"),
             ],
-            path: "Sources/MLXQwenImageEditTurbo"
+            path: "Sources/MLXQwenImageEditTurbo",
+            resources: [.process("Resources")]
         ),
         .testTarget(
             name: "QwenImageEditTests",

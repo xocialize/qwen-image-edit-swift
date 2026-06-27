@@ -154,8 +154,10 @@ public final class QwenImageEditTurboPackage: ModelPackage {
                 IEditContract.descriptor(
                     name: "qwen-image-edit-turbo",
                     summary: "Qwen-Image-Edit-2511 fast tier: Lightning 4-step DMD LoRA "
-                        + "applied at runtime over the 20B DiT. Multi-image fusion, "
-                        + "identity-preserving edits, 1024²-area output, 4-step single-pass.",
+                        + "applied at runtime over the 20B DiT. Optional community effect LoRA "
+                        + "per request (metaData loraId/loraStrength, hot-swapped, lazy-cached "
+                        + "from the bundled registry). Multi-image fusion, identity-preserving "
+                        + "edits, 1024²-area output, 4-step single-pass.",
                     modes: [turboMode]
                 )
             ]
@@ -164,6 +166,13 @@ public final class QwenImageEditTurboPackage: ModelPackage {
 
     private let configuration: Configuration
     private var generator: QwenImageEditGenerator?
+    // Effect-LoRA dropdown: Lightning is always-on; the selected effect rank-stacks on top
+    // via the swapper without reloading the 20B base.
+    private var swapper: QwenImageEditLoRASwapper?
+    private var lightningURL: URL?
+    private var registry: LoRARegistry?
+    private var cache: LoRACache?
+    private var appliedSelection: (id: String?, strength: Float) = (nil, 0)
 
     public nonisolated init(configuration: Configuration) {
         self.configuration = configuration
@@ -218,10 +227,23 @@ public final class QwenImageEditTurboPackage: ModelPackage {
                 eval(transformer)
             }
         }
-        // Runtime DMD: apply Lightning in the activation path (survives bf16/int4; a fused
-        // bf16 snapshot would lose it).
-        try QwenImageEditLoRA.apply(
-            diffusersLoRA: lora, to: transformer, strength: configuration.strength)
+        // Runtime DMD via a hot-swapper: Lightning is always-on (strength = config.strength);
+        // per-request effect LoRAs (the dropdown) rank-stack on top without reloading the 20B
+        // base. Lightning in the activation path survives bf16/int4 (a fused bf16 snapshot
+        // would lose it).
+        let swapper = QwenImageEditLoRASwapper(model: transformer)
+        try swapper.set([(lora, configuration.strength)])
+        self.swapper = swapper
+        self.lightningURL = lora
+        self.appliedSelection = (nil, 0)
+
+        // Effect registry (HF-referencing manifest) + lazy download cache.
+        self.registry = try LoRARegistry.bundled()
+        let cacheRoot = configuration.modelsRootDirectory
+            ?? (try? FileManager.default.url(
+                for: .cachesDirectory, in: .userDomainMask, appropriateFor: nil, create: true))
+            ?? URL(fileURLWithPath: NSTemporaryDirectory())
+        self.cache = LoRACache(directory: cacheRoot.appendingPathComponent("qie-lora-cache"))
 
         let encoder = try await QwenVLPromptEncoder.load(
             snapshot: snapshot, bits: configuration.encoderBits,
@@ -235,14 +257,38 @@ public final class QwenImageEditTurboPackage: ModelPackage {
 
     public func unload() async {
         generator = nil
+        swapper = nil
+        registry = nil
+        cache = nil
+        appliedSelection = (nil, 0)
     }
 
     public func run(_ request: any CapabilityRequest) async throws -> any CapabilityResponse {
-        guard let generator else { throw PackageError.notLoaded }
+        guard let generator, let swapper, let lightningURL else { throw PackageError.notLoaded }
         guard request.capability == .imageEdit, let edit = request as? IEditRequest else {
             throw PackageError.unsupportedCapability(request.capability)
         }
         guard !edit.images.isEmpty else { throw QwenImageEditTurboPackageError.imageDecode }
+
+        // Per-request effect selection (the dropdown), carried opaquely in metaData. Absent or
+        // empty id = base turbo (Lightning only). Re-apply only when the selection changes, so
+        // repeated edits with the same effect skip the swap.
+        let selectedId = edit.metaData[LoRAMetaKeys.id]?.asString.flatMap { $0.isEmpty ? nil : $0 }
+        if let id = selectedId {
+            guard let registry, let cache, let entry = registry.entry(id: id) else {
+                throw LoRARegistryError.unknownAdapter(id)
+            }
+            let strength = edit.metaData[LoRAMetaKeys.strength]?.asFloat ?? entry.defaultStrength
+            if appliedSelection.id != id || appliedSelection.strength != strength {
+                let file = try await cache.ensure(entry)
+                try swapper.set([(lightningURL, configuration.strength), (file, strength)])
+                appliedSelection = (id, strength)
+            }
+        } else if appliedSelection.id != nil {
+            try swapper.set([(lightningURL, configuration.strength)])  // revert to base turbo
+            appliedSelection = (nil, 0)
+        }
+
         try Task.checkCancellation()
         let inputs = try edit.images.map { try Self.decodeRGB($0.data) }
 
