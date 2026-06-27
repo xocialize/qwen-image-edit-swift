@@ -66,15 +66,56 @@ public enum QwenImageEditLoRA {
         }
     }
 
-    private static let aSuffixes = [".lora_A.default.weight", ".lora_A.weight"]
-    private static let bSuffixes = [".lora_B.default.weight", ".lora_B.weight"]
+    // A/B factor suffixes across the LoRA dialects in the wild (verified by header-probing
+    // the prithivMLmods/dx8152/fal/autoweeb/kohya community Qwen-Image-Edit adapters):
+    //   * diffusers PEFT:  `.lora_A.weight` / `.lora_A.default.weight` (and _B)
+    //   * diffusers alt:   `.lora.down.weight` / `.lora.up.weight`   (e.g. Anything2Real)
+    //   * kohya/sd-scripts:`.lora_down.weight` / `.lora_up.weight`   (e.g. Manga-Tone)
+    // down == A (the [rank, in] projection); up == B (the [out, rank]).
+    private static let aSuffixes = [
+        ".lora_A.default.weight", ".lora_A.weight", ".lora.down.weight", ".lora_down.weight",
+    ]
+    private static let bSuffixes = [
+        ".lora_B.default.weight", ".lora_B.weight", ".lora.up.weight", ".lora_up.weight",
+    ]
     private static let alphaSuffix = ".alpha"
 
-    /// diffusers LoRA child path -> engine DiT module path (both dialects; mirrors
-    /// Weights.sanitizeDiTKey). Attention names already match.
-    private static func remap(_ path: String) -> String {
-        var s = path
+    /// kohya flattens the module path to underscores under a `lora_unet_` prefix (and the
+    /// submodule names themselves contain underscores, so a naive `_`->`.` is wrong). Map the
+    /// known block-relative submodules explicitly back to their dotted form (pre-remap, so the
+    /// `.net.0.proj`/`.img_mod.1` normalizations below still fire).
+    private static let kohyaSubmodule: [String: String] = [
+        "attn_to_q": "attn.to_q", "attn_to_k": "attn.to_k", "attn_to_v": "attn.to_v",
+        "attn_add_q_proj": "attn.add_q_proj", "attn_add_k_proj": "attn.add_k_proj",
+        "attn_add_v_proj": "attn.add_v_proj",
+        "attn_to_add_out": "attn.to_add_out", "attn_to_out_0": "attn.to_out.0",
+        "img_mlp_net_0_proj": "img_mlp.net.0.proj", "img_mlp_net_2": "img_mlp.net.2",
+        "txt_mlp_net_0_proj": "txt_mlp.net.0.proj", "txt_mlp_net_2": "txt_mlp.net.2",
+        "img_mod_1": "img_mod.1", "txt_mod_1": "txt_mod.1",
+    ]
+
+    /// Convert a kohya `lora_unet_transformer_blocks_<n>_<submodule>` base to the dotted
+    /// `transformer_blocks.<n>.<submodule>` form. Returns nil for non-kohya / unknown paths.
+    static func dekohya(_ s: String) -> String? {
+        guard s.hasPrefix("lora_unet_") else { return nil }
+        let body = String(s.dropFirst("lora_unet_".count))
+        guard body.hasPrefix("transformer_blocks_") else { return nil }
+        let afterBlocks = body.dropFirst("transformer_blocks_".count)
+        guard let usc = afterBlocks.firstIndex(of: "_") else { return nil }
+        let idx = String(afterBlocks[..<usc])
+        guard Int(idx) != nil else { return nil }
+        let rest = String(afterBlocks[afterBlocks.index(after: usc)...])
+        guard let dotted = kohyaSubmodule[rest] else { return nil }
+        return "transformer_blocks.\(idx).\(dotted)"
+    }
+
+    /// diffusers/kohya LoRA child path -> engine DiT module path. Handles the `transformer.`
+    /// and `diffusion_model.` top-level prefixes and the kohya underscore flattening, then the
+    /// shared submodule normalizations (mirrors Weights.sanitizeDiTKey). Attention names match.
+    static func remap(_ path: String) -> String {
+        var s = dekohya(path) ?? path
         if s.hasPrefix("transformer.") { s.removeFirst("transformer.".count) }
+        else if s.hasPrefix("diffusion_model.") { s.removeFirst("diffusion_model.".count) }
         return s
             .replacingOccurrences(of: ".img_mod.1", with: ".img_mod")
             .replacingOccurrences(of: ".txt_mod.1", with: ".txt_mod")
@@ -83,7 +124,7 @@ public enum QwenImageEditLoRA {
     }
 
     /// Strip the `transformer_blocks.<i>.` prefix to get the block-relative module path.
-    private static func blockRelative(_ modelPath: String) -> String? {
+    static func blockRelative(_ modelPath: String) -> String? {
         let parts = modelPath.split(separator: ".", maxSplits: 2, omittingEmptySubsequences: false)
         guard parts.count == 3, parts[0] == "transformer_blocks" else { return nil }
         return String(parts[2])
@@ -142,13 +183,17 @@ public enum QwenImageEditLoRA {
         var ranks: [String: Int] = [:]
         var targetKeys = Set<String>()
         for base in bases {
+            // Only adapters on a transformer block get a LoRALinear; skip any top-level
+            // target (e.g. img_in / time_text_embed) rather than emit an orphan param that
+            // would fail update(verify: .noUnusedKeys). Generic loader: skip, don't crash.
+            guard let rel = blockRelative(base) else { continue }
             let present = perLoRA.compactMap { $0[base] }  // same order for a and b
             let aCat = present.count == 1 ? present[0].a : concatenated(present.map(\.a), axis: 1)
             let bCat = present.count == 1 ? present[0].b : concatenated(present.map(\.b), axis: 0)
             params[base + ".lora_a"] = aCat
             params[base + ".lora_b"] = bCat
             ranks[base] = aCat.dim(1)
-            if let rel = blockRelative(base) { targetKeys.insert(rel) }
+            targetKeys.insert(rel)
         }
         return (params, ranks, targetKeys)
     }
@@ -229,5 +274,68 @@ public enum QwenImageEditLoRA {
             }
             if !update.isEmpty { block.update(modules: .unflattened(update)) }
         }
+    }
+}
+
+/// Stateful LoRA hot-swapper for a resident DiT: switch the active adapter set (e.g. an
+/// effect picked from a dropdown) WITHOUT reloading the 20B base.
+///
+/// `set(_:)` first detaches the current adapter — restoring the pristine base modules
+/// captured on first use — then applies the new combo. Because `LoRALinear` shares the base
+/// weight `MLXArray` by reference (`super.init(weight:bias:)`), neither the capture nor a
+/// swap duplicates base weights: only the small `lora_a`/`lora_b` factors are added and freed
+/// (≈ one rank-r pair per adapted Linear). Re-attaching is required because `LoRALinear`
+/// IS-A `Linear`, so a naive second `apply()` would wrap a LoRALinear in another LoRALinear.
+///
+/// Not thread-safe; drive it from the same actor that owns the DiT.
+public final class QwenImageEditLoRASwapper {
+    private let model: QwenImageTransformer2DModel
+    private let dtype: DType
+    /// full `transformer_blocks.<i>.<rel>` path -> pristine base module (Linear/QuantizedLinear).
+    private var pristine: [String: Module] = [:]
+    /// block-relative keys currently realized as a LoRALinear.
+    private var applied: Set<String> = []
+
+    public init(model: QwenImageTransformer2DModel, dtype: DType = .bfloat16) {
+        self.model = model
+        self.dtype = dtype
+    }
+
+    /// The block-relative keys currently adapted (empty = pure base).
+    public var activeKeys: Set<String> { applied }
+
+    /// Make `loras` the active adapter set. An empty array leaves the pristine base in place.
+    /// Diffusers/kohya dialects are handled by `QwenImageEditLoRA` (see `combined`).
+    public func set(_ loras: [(url: URL, strength: Float)]) throws {
+        detach()
+        guard !loras.isEmpty else { return }
+        let (params, ranks, targetKeys) = try QwenImageEditLoRA.combined(loras, dtype: dtype)
+        for (i, block) in model.transformerBlocks.enumerated() {
+            var update: [(String, Module)] = []
+            for (key, child) in block.namedModules() where targetKeys.contains(key) {
+                guard let linear = child as? Linear, let rank = ranks["transformer_blocks.\(i).\(key)"]
+                else { continue }
+                // First time we touch this target, the child IS the pristine base — capture it
+                // (shares weights by reference, so capture is free) so detach can restore it.
+                pristine["transformer_blocks.\(i).\(key)"] = pristine["transformer_blocks.\(i).\(key)"] ?? linear
+                update.append((key, LoRALinear.from(linear: linear, rank: rank, scale: 1.0)))
+            }
+            if !update.isEmpty { block.update(modules: .unflattened(update)) }
+        }
+        try model.update(parameters: ModuleParameters.unflattened(params), verify: .noUnusedKeys)
+        applied = targetKeys
+    }
+
+    /// Restore the pristine base in every currently-adapted target.
+    public func detach() {
+        guard !applied.isEmpty else { return }
+        for (i, block) in model.transformerBlocks.enumerated() {
+            var restore: [(String, Module)] = []
+            for key in applied {
+                if let orig = pristine["transformer_blocks.\(i).\(key)"] { restore.append((key, orig)) }
+            }
+            if !restore.isEmpty { block.update(modules: .unflattened(restore)) }
+        }
+        applied = []
     }
 }
