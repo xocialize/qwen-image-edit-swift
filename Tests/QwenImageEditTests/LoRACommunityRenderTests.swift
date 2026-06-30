@@ -55,9 +55,9 @@ final class LoRACommunityRenderTests: XCTestCase {
             try QwenImageEditLoRA.apply(diffusersLoRAs: loras, to: dit)
             return QwenImageEditGenerator(encoder: encoder, transformer: dit, vae: vae)
         }
-        func render(_ tag: String, _ gen: QwenImageEditGenerator, prompt: String) throws {
+        func render(_ tag: String, _ gen: QwenImageEditGenerator, prompt: String) async throws {
             let t = Date()
-            let (px, w, h) = try gen.generate(
+            let (px, w, h) = try await gen.generate(
                 image: image, prompt: prompt, negativePrompt: " ",
                 steps: 4, trueCFGScale: 1.0, seed: 42, progress: { _, _ in })
             let out = desktop.appendingPathComponent("qie-comm-\(tag).png")
@@ -71,16 +71,16 @@ final class LoRACommunityRenderTests: XCTestCase {
         // Controls: Lightning only, both prompts (DiT is prompt-independent, reuse it).
         do {
             let ctrl = try generator([(Self.lightning, 4.0)])
-            try render("anime-ctrl", ctrl, prompt: animePrompt)
-            try render("pixar-ctrl", ctrl, prompt: pixarPrompt)
+            try await render("anime-ctrl", ctrl, prompt: animePrompt)
+            try await render("pixar-ctrl", ctrl, prompt: pixarPrompt)
         }
         GPU.clearCache()
         // Photo-to-Anime — exercises the new diffusion_model. prefix dialect on real weights.
-        do { try render("anime-lora", try generator([(Self.lightning, 4.0), (Self.anime, 1.0)]),
+        do { try await render("anime-lora", try generator([(Self.lightning, 4.0), (Self.anime, 1.0)]),
                         prompt: animePrompt) }
         GPU.clearCache()
         // Pixar-Inspired-3D — clean transformer. dialect.
-        do { try render("pixar-lora", try generator([(Self.lightning, 4.0), (Self.pixar, 1.0)]),
+        do { try await render("pixar-lora", try generator([(Self.lightning, 4.0), (Self.pixar, 1.0)]),
                         prompt: pixarPrompt) }
     }
 }

@@ -57,7 +57,7 @@ final class LoRAStrengthSweepTests: XCTestCase {
             for s in strengths {
                 try swapper.set([(C.lightning, 4.0), (e.file, s)])
                 let t = Date()
-                let (px, w, h) = try gen.generate(
+                let (px, w, h) = try await gen.generate(
                     image: image, prompt: e.prompt, negativePrompt: " ",
                     steps: 4, trueCFGScale: 1.0, seed: 42, progress: { _, _ in })
                 let out = desktop.appendingPathComponent("qie-sweep-\(e.tag)-s\(Int(s)).png")

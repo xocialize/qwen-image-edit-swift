@@ -80,7 +80,12 @@ let package = Package(
         ),
         .testTarget(
             name: "MLXQwenImageEditTests",
-            dependencies: ["MLXQwenImageEdit"],
+            dependencies: [
+                "MLXQwenImageEdit",
+                // split-footprint mem-bench needs the core generator + MLX peak APIs directly.
+                "QwenImageEdit",
+                .product(name: "MLX", package: "mlx-swift"),
+            ],
             path: "Tests/MLXQwenImageEditTests"
         ),
         .testTarget(

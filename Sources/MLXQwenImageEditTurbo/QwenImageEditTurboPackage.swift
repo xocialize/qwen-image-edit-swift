@@ -25,7 +25,7 @@ import UniformTypeIdentifiers
 public let turboMode = Mode(rawValue: "turbo")
 
 /// Init-time configuration (C9): base 2511 snapshot + Lightning LoRA + DMD defaults.
-public struct QwenImageEditTurboConfiguration: PackageConfiguration, ModelStorable {
+public struct QwenImageEditTurboConfiguration: PackageConfiguration, ModelStorable, QuantConfigured {
     /// Base snapshot root with `transformer/`, `vae/`, `text_encoder/`, `processor/`.
     public var snapshotPath: String
     /// Diffusers-format Lightning 4-step LoRA (.safetensors), applied at load.
@@ -67,6 +67,14 @@ public struct QwenImageEditTurboConfiguration: PackageConfiguration, ModelStorab
     public var defaultSteps: Int
     public var defaultTrueCFGScale: Float
     public var modelsRootDirectory: URL?
+
+    /// The selected DiT tier: int4 when the DiT loads (or quantizes) to 4-bit, else bf16.
+    /// Lets the memory governor charge the matching split `QuantFootprint` (bf16 vs int4)
+    /// rather than the largest-that-fits guess. The VL-7B encoder's own bits are a separate
+    /// transient (loaded per request, evicted before the denoise peak — see the generator).
+    public var quant: Quant {
+        (quantizedDiTPath != nil || ditBits == 4) ? .int4 : .bf16
+    }
 
     public init(
         snapshotPath: String =
@@ -132,18 +140,32 @@ public final class QwenImageEditTurboPackage: ModelPackage {
             provenance: Provenance(
                 sourceRepo: "lightx2v/Qwen-Image-Edit-2511-Lightning", revision: "main", tier: 1),
             requirements: RequirementsManifest(
-                // Measured resident (1024², runtime LoRA adds only rank factors):
-                //   bf16: ~57 GB (20B DiT + bf16 VL-7B + fp32 VAE).
-                //   int4 (ditBits=4, encoderBits=4, modulationBits=8): ~22 GB, quality
-                //     intact — attn/mlp int4, conditioning-critical modulation int8 (int4
-                //     there is grainy), VL-7B int4; small top-level projections + fp32 VAE
-                //     stay full precision. Quantize-after-load PEAKs at ~41 GB (bf16 load);
-                //     with quantizedDiTPath + quantizedEncoderPath (pre-quantized files) the
-                //     LOAD peak drops to ~21 GB (≈ resident, no bf16 materialized); inference
-                //     peak ~29 GB, or ~25.5 GB with lowPrecisionVAE (bf16 VAE). 4-step DMD.
+                // Split footprint (efficiency contract 1.14.0). Per-stage eviction (P2): the VL-7B
+                // encoder loads per request and is evicted before the denoise peak — a TRANSIENT,
+                // not a resident, in BOTH tiers. The Lightning DMD LoRA rides the resident DiT
+                // (rank factors only).
+                //   bf16: same base weights as QwenImageEdit. Resident floor = DiT bf16 40.9 GB +
+                //     fp32 VAE 0.5 GB ≈ 41.4 GB (measured base, QIE_MEMBENCH); activation (peak −
+                //     floor, ~16.6 GB transient encoder load) ≈ 21 GB. Old flat 57 GB folded the
+                //     encoder into resident.
+                //   int4 (ditBits=4, encoderBits=4, modulationBits=8): attn/mlp int4, conditioning-
+                //     critical modulation int8 (int4 there is grainy), VL-7B int4; small top-level
+                //     projections + fp32 VAE stay full precision. Resident floor ≈ int4 DiT ~11 GB +
+                //     fp32 VAE 0.5 GB + small bf16 projections ≈ 12 GB (encoder int4 ~4 GB is now a
+                //     transient, not co-resident); inference peak ~29 GB → activation ≈ 17 GB (the
+                //     transient int4 encoder + DiT activations), or lower with lowPrecisionVAE.
+                //     [int4 split DERIVED from the documented component measurements (resident ~22 GB
+                //     pre-split included the co-resident encoder); FLAGGED for a clean QIE_MEMBENCH
+                //     re-measure with quantizedDiTPath+quantizedEncoderPath once the image app is up.]
+                //   Pre-quantized files (quantizedDiTPath+quantizedEncoderPath) make int4 load at
+                //     ≈ resident with no bf16 peak. 4-step DMD.
                 footprints: [
-                    QuantFootprint(quant: .bf16, residentBytes: 57_000_000_000),
-                    QuantFootprint(quant: .int4, residentBytes: 22_000_000_000),
+                    QuantFootprint(
+                        quant: .bf16, residentBytes: 42_000_000_000,
+                        peakActivationBytes: 21_000_000_000),
+                    QuantFootprint(
+                        quant: .int4, residentBytes: 12_000_000_000,
+                        peakActivationBytes: 17_000_000_000),
                 ],
                 requiredBackends: [.metalGPU],
                 os: OSRequirement(minMacOS: SemanticVersion(major: 26, minor: 0, patch: 0)),
@@ -245,14 +267,20 @@ public final class QwenImageEditTurboPackage: ModelPackage {
             ?? URL(fileURLWithPath: NSTemporaryDirectory())
         self.cache = LoRACache(directory: cacheRoot.appendingPathComponent("qie-lora-cache"))
 
-        let encoder = try await QwenVLPromptEncoder.load(
-            snapshot: snapshot, bits: configuration.encoderBits,
-            quantizedTextModelPath: configuration.quantizedEncoderPath)
+        // The DiT (with the resident LoRA swapper) + VAE stay resident; the VL-7B encoder is
+        // loaded per request and evicted before the denoise peak (efficiency contract 1.14.0).
+        let encoderBits = configuration.encoderBits
+        let quantizedEncoderPath = configuration.quantizedEncoderPath
         let vae = try QwenImageEditWeights.loadVAE(
             directory: snapshot.appendingPathComponent("vae"),
             dtype: configuration.lowPrecisionVAE ? .bfloat16 : .float32)
         generator = QwenImageEditGenerator(
-            encoder: encoder, transformer: transformer, vae: vae)
+            encoderProvider: {
+                try await QwenVLPromptEncoder.load(
+                    snapshot: snapshot, bits: encoderBits,
+                    quantizedTextModelPath: quantizedEncoderPath)
+            },
+            transformer: transformer, vae: vae)
     }
 
     public func unload() async {
@@ -292,7 +320,7 @@ public final class QwenImageEditTurboPackage: ModelPackage {
         try Task.checkCancellation()
         let inputs = try edit.images.map { try Self.decodeRGB($0.data) }
 
-        let (pixels, w, h) = try generator.generate(
+        let (pixels, w, h) = try await generator.generate(
             images: inputs,
             prompt: edit.prompt,
             negativePrompt: edit.negativePrompt ?? " ",

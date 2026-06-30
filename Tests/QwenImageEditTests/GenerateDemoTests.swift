@@ -36,7 +36,7 @@ final class GenerateDemoTests: XCTestCase {
             encoder: encoder, transformer: transformer, vae: vae)
 
         let start = Date()
-        let (pixels, w, h) = try generator.generate(
+        let (pixels, w, h) = try await generator.generate(
             image: image,
             prompt: meta["prompt"] as! String,
             negativePrompt: meta["negative_prompt"] as! String,

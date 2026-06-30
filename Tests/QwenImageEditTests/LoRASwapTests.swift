@@ -28,8 +28,8 @@ final class LoRASwapTests: XCTestCase {
             directory: C.modelDir.appendingPathComponent("vae"), dtype: .bfloat16)
         let pixarPrompt = "Transform it into Pixar-inspired 3D"
 
-        func render(_ dit: QwenImageTransformer2DModel, _ prompt: String) throws -> [UInt8] {
-            try QwenImageEditGenerator(encoder: encoder, transformer: dit, vae: vae)
+        func render(_ dit: QwenImageTransformer2DModel, _ prompt: String) async throws -> [UInt8] {
+            try await QwenImageEditGenerator(encoder: encoder, transformer: dit, vae: vae)
                 .generate(image: image, prompt: prompt, negativePrompt: " ",
                           steps: 4, trueCFGScale: 1.0, seed: 42, progress: { _, _ in }).pixels
         }
@@ -42,15 +42,15 @@ final class LoRASwapTests: XCTestCase {
         let dit = try freshDiT()
         let swapper = QwenImageEditLoRASwapper(model: dit)
         try swapper.set([(C.lightning, 4.0), (C.anime, 1.0)])
-        _ = try render(dit, "transform into anime")
+        _ = try await render(dit, "transform into anime")
         try swapper.set([(C.lightning, 4.0), (C.pixar, 1.0)])
-        let swapped = try render(dit, pixarPrompt)
+        let swapped = try await render(dit, pixarPrompt)
         GPU.clearCache()
 
         // Reference: pixar applied stateless on a fresh DiT.
         let freshPixar = try freshDiT()
         try QwenImageEditLoRA.apply(diffusersLoRAs: [(C.lightning, 4.0), (C.pixar, 1.0)], to: freshPixar)
-        let reference = try render(freshPixar, pixarPrompt)
+        let reference = try await render(freshPixar, pixarPrompt)
 
         XCTAssertEqual(swapped.count, reference.count)
         var maxAbs = 0, sum = 0

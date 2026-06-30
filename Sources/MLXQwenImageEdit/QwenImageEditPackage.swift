@@ -15,12 +15,16 @@ import QwenImageEdit
 import UniformTypeIdentifiers
 
 /// Init-time configuration (C9): the 2511 snapshot root and generation defaults.
-public struct QwenImageEditConfiguration: PackageConfiguration, ModelStorable {
+public struct QwenImageEditConfiguration: PackageConfiguration, ModelStorable, QuantConfigured {
     /// Snapshot root with `transformer/`, `vae/`, `text_encoder/`, `processor/`.
     public var snapshotPath: String
     public var defaultSteps: Int
     public var defaultTrueCFGScale: Float
     public var modelsRootDirectory: URL?
+
+    /// Always bf16 (the only declared tier for the base package). Lets the memory governor
+    /// charge the matching split `QuantFootprint` instead of the largest-that-fits guess.
+    public var quant: Quant { .bf16 }
 
     public init(
         snapshotPath: String =
@@ -64,9 +68,19 @@ public final class QwenImageEditPackage: ModelPackage {
             provenance: Provenance(
                 sourceRepo: "Qwen/Qwen-Image-Edit-2511", revision: "main", tier: 1),
             requirements: RequirementsManifest(
-                // Measured regime (1024², 20 steps, bf16 DiT + bf16 VL-7B + fp32 VAE):
-                // ~60 GB resident. 4-bit DiT+VL is the tracked follow-up (~16 GB).
-                footprints: [QuantFootprint(quant: .bf16, residentBytes: 60_000_000_000)],
+                // Split footprint (efficiency contract 1.14.0). Per-stage eviction (P2): the
+                // VL-7B encoder loads per request and is evicted before the denoise peak, so it
+                // is a TRANSIENT, not a resident. Measured M5 Max, 1024²/8-step CFG4 (QIE_MEMBENCH
+                // in PackageTests): resident floor (DiT bf16 40.9 GB + fp32 VAE 0.5 GB) = 41.4 GB;
+                // worst peak 59.2 GB → activation (peak − floor, dominated by the ~16.6 GB transient
+                // encoder load during encode) = 17.9 GB → 21 GB at +20% headroom. Old flat declaration
+                // folded the encoder into resident (60 GB); the split lets two base models co-reside
+                // under ONE shared activation reserve. 4-bit DiT+VL is the Turbo int4 tier.
+                footprints: [
+                    QuantFootprint(
+                        quant: .bf16, residentBytes: 42_000_000_000,
+                        peakActivationBytes: 21_000_000_000)
+                ],
                 requiredBackends: [.metalGPU],
                 os: OSRequirement(minMacOS: SemanticVersion(major: 26, minor: 0, patch: 0)),
                 chipFloor: .max
@@ -98,13 +112,15 @@ public final class QwenImageEditPackage: ModelPackage {
             atPath: snapshot.appendingPathComponent("transformer").path)
         else { throw QwenImageEditPackageError.unreadableSnapshot(snapshot.path) }
 
-        let encoder = try await QwenVLPromptEncoder.load(snapshot: snapshot)
+        // DiT + VAE stay resident; the VL-7B encoder is loaded per request and evicted
+        // before the denoise peak (efficiency contract 1.14.0 — see QwenImageEditGenerator).
         let transformer = try QwenImageEditWeights.loadDiTFromPT(
             directory: snapshot.appendingPathComponent("transformer"), dtype: .bfloat16)
         let vae = try QwenImageEditWeights.loadVAE(
             directory: snapshot.appendingPathComponent("vae"), dtype: .float32)
         generator = QwenImageEditGenerator(
-            encoder: encoder, transformer: transformer, vae: vae)
+            encoderProvider: { try await QwenVLPromptEncoder.load(snapshot: snapshot) },
+            transformer: transformer, vae: vae)
     }
 
     public func unload() async {
@@ -124,7 +140,7 @@ public final class QwenImageEditPackage: ModelPackage {
         try Task.checkCancellation()
         let inputs = try edit.images.map { try Self.decodeRGB($0.data) }
 
-        let (pixels, w, h) = try generator.generate(
+        let (pixels, w, h) = try await generator.generate(
             images: inputs,
             prompt: edit.prompt,
             negativePrompt: edit.negativePrompt ?? " ",

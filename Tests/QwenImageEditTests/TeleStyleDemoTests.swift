@@ -45,7 +45,7 @@ final class TeleStyleDemoTests: XCTestCase {
             encoder: encoder, transformer: transformer, vae: vae)
 
         let start = Date()
-        let (pixels, w, h) = try generator.generate(
+        let (pixels, w, h) = try await generator.generate(
             images: [content, style],           // image 1 = content, image 2 = style
             prompt: Self.stylePrompt,
             steps: 4,                            // Lightning/DMD 4-step
@@ -76,7 +76,7 @@ final class TeleStyleDemoTests: XCTestCase {
         let generator = QwenImageEditGenerator(
             encoder: encoder, transformer: transformer, vae: vae)
 
-        let (pixels, w, h) = try generator.generate(
+        let (pixels, w, h) = try await generator.generate(
             image: content,
             prompt: "make it a watercolor painting",
             steps: 4, trueCFGScale: 1.0, seed: 123,

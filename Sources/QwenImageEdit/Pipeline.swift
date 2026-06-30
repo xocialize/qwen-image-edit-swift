@@ -65,18 +65,73 @@ public enum QwenImagePipeline {
 }
 
 /// End-to-end image editing: VL encode -> denoise (zero_cond_t DiT, true CFG) -> decode.
+///
+/// **Per-stage residency (efficiency contract 1.14.0).** The Qwen2.5-VL prompt encoder
+/// (~16 GB bf16) is used ONCE per request to encode the prompt + conditioning images,
+/// then sits idle through the entire DiT denoise loop and VAE decode — the heaviest,
+/// longest phase. So the generator does NOT hold the encoder resident: it owns an async
+/// `encoderProvider` (the wrapper's loader), loads the encoder on demand, encodes, then
+/// **evicts it (`nil` + `Memory.clearCache()`) before the denoise peak**. Only the DiT
+/// (transformer, with any bound LoRAs) and the small VAE stay resident — the DiT is the
+/// resident floor + the activation peak. All three wrappers (base/Turbo/TeleStyle) share
+/// this core, so they all inherit the eviction. Tradeoff: the encoder re-loads per request
+/// (cheap encode vs. expensive denoise) — a `keepEncoderResident` flag covers big-RAM tiers.
 public final class QwenImageEditGenerator {
-    public let encoder: QwenVLPromptEncoder
+    /// Lazy loader for the Qwen2.5-VL prompt encoder. Invoked per request, then evicted
+    /// before the denoise peak (unless `keepEncoderResident`).
+    public let encoderProvider: () async throws -> QwenVLPromptEncoder
     public let transformer: QwenImageTransformer2DModel
     public let vae: QwenImageVAE
+    /// Keep the encoder resident across requests (skip per-request evict+reload). Default
+    /// `false` = evict-between-stages, the memory-citizen default; set `true` on big-RAM tiers.
+    public let keepEncoderResident: Bool
 
+    /// Hot encoder when `keepEncoderResident` is set (avoids the reload each request).
+    private var residentEncoder: QwenVLPromptEncoder?
+
+    /// Staged init: the encoder is loaded on demand via `encoderProvider`, not held resident.
     public init(
+        encoderProvider: @escaping () async throws -> QwenVLPromptEncoder,
+        transformer: QwenImageTransformer2DModel,
+        vae: QwenImageVAE,
+        keepEncoderResident: Bool = false
+    ) {
+        self.encoderProvider = encoderProvider
+        self.transformer = transformer
+        self.vae = vae
+        self.keepEncoderResident = keepEncoderResident
+    }
+
+    /// Back-compat init from an already-loaded encoder. The encoder is kept resident (the
+    /// pre-staged behavior) since the caller has no way to reload it. Prefer the
+    /// `encoderProvider` init to get per-stage eviction.
+    public convenience init(
         encoder: QwenVLPromptEncoder, transformer: QwenImageTransformer2DModel,
         vae: QwenImageVAE
     ) {
-        self.encoder = encoder
-        self.transformer = transformer
-        self.vae = vae
+        self.init(
+            encoderProvider: { encoder }, transformer: transformer, vae: vae,
+            keepEncoderResident: true)
+    }
+
+    /// Obtain the prompt encoder for this request. Reuses the hot encoder when
+    /// `keepEncoderResident`, otherwise loads a fresh one via `encoderProvider`.
+    private func loadEncoder(isolation: isolated (any Actor)? = #isolation) async throws
+        -> QwenVLPromptEncoder
+    {
+        if keepEncoderResident, let residentEncoder { return residentEncoder }
+        let encoder = try await encoderProvider()
+        if keepEncoderResident { residentEncoder = encoder }
+        return encoder
+    }
+
+    /// Drop the encoder's weights before the denoise peak. When keeping it resident this is a
+    /// no-op (the hot encoder is held in `residentEncoder`); otherwise it nils the caller's
+    /// last strong reference and clears the buffer cache, reclaiming the ~16 GB.
+    private func evictEncoder(_ encoder: inout QwenVLPromptEncoder?) {
+        guard !keepEncoderResident else { return }
+        encoder = nil           // release the encoder's MLXArrays (last strong ref)
+        Memory.clearCache()     // return the freed buffers to the OS before denoise
     }
 
     /// Edit a single `image` per `prompt`. Returns interleaved RGB8 + dimensions.
@@ -88,9 +143,10 @@ public final class QwenImageEditGenerator {
         steps: Int = 20,
         trueCFGScale: Float = 4.0,
         seed: UInt64 = 0,
-        progress: ((Int, Int) -> Void)? = nil
-    ) throws -> (pixels: [UInt8], width: Int, height: Int) {
-        try generate(
+        progress: ((Int, Int) -> Void)? = nil,
+        isolation: isolated (any Actor)? = #isolation
+    ) async throws -> (pixels: [UInt8], width: Int, height: Int) {
+        try await generate(
             images: [image], prompt: prompt, negativePrompt: negativePrompt,
             steps: steps, trueCFGScale: trueCFGScale, seed: seed, progress: progress)
     }
@@ -111,8 +167,9 @@ public final class QwenImageEditGenerator {
         steps: Int = 20,
         trueCFGScale: Float = 4.0,
         seed: UInt64 = 0,
-        progress: ((Int, Int) -> Void)? = nil
-    ) throws -> (pixels: [UInt8], width: Int, height: Int) {
+        progress: ((Int, Int) -> Void)? = nil,
+        isolation: isolated (any Actor)? = #isolation
+    ) async throws -> (pixels: [UInt8], width: Int, height: Int) {
         guard let content = images.first else {
             throw QwenImageEditError.invalidInput("at least one image is required")
         }
@@ -124,9 +181,20 @@ public final class QwenImageEditGenerator {
         //    and emits "Picture i" blocks for all images). The negative branch is only
         //    needed when true CFG is active (scale > 1); the DMD/Lightning tier runs at
         //    scale 1.0 (no CFG), so we skip it — matching the reference `do_true_cfg`.
+        //
+        //    PER-STAGE EVICTION: load the VL-7B encoder, encode, force-materialize the
+        //    embeddings (`eval`), then drop the encoder + clear the cache BEFORE the denoise
+        //    loop so the ~16 GB encoder is not co-resident with the DiT activation peak.
         let doCFG = trueCFGScale > 1
-        let posEmbeds = try encoder.encode(prompt: prompt, images: images)
-        let negEmbeds = doCFG ? try encoder.encode(prompt: negativePrompt, images: images) : nil
+        // Scope the encoder so its only strong reference is released before the denoise loop.
+        var encoderRef: QwenVLPromptEncoder? = try await loadEncoder()
+        let posEmbeds = try encoderRef!.encode(prompt: prompt, images: images)
+        let negEmbeds =
+            doCFG ? try encoderRef!.encode(prompt: negativePrompt, images: images) : nil
+        // Materialize the embeddings off the encoder graph, drop the encoder ref, then clear
+        // the cache — reclaiming the ~16 GB before the DiT denoise peak.
+        if let negEmbeds { eval(posEmbeds, negEmbeds) } else { eval(posEmbeds) }
+        evictEncoder(&encoderRef)
         let dtype = posEmbeds.dtype
 
         // 2. Per-image VAE conditioning latents (each at its own 1024²-area /32 size),

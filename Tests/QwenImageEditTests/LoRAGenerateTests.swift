@@ -55,10 +55,10 @@ final class LoRAGenerateTests: XCTestCase {
                 directory: Self.modelDir.appendingPathComponent("transformer"), dtype: .bfloat16)
         }
         func render(_ tag: String, _ transformer: QwenImageTransformer2DModel,
-                    steps: Int, cfg: Float) throws {
+                    steps: Int, cfg: Float) async throws {
             let gen = QwenImageEditGenerator(encoder: encoder, transformer: transformer, vae: vae)
             let t = Date()
-            let (pixels, w, h) = try gen.generate(
+            let (pixels, w, h) = try await gen.generate(
                 image: image, prompt: prompt, negativePrompt: neg,
                 steps: steps, trueCFGScale: cfg, seed: seed, progress: { _, _ in })
             let out = desktop.appendingPathComponent("qie-\(tag).png")
@@ -67,14 +67,14 @@ final class LoRAGenerateTests: XCTestCase {
         }
 
         // Base at 4-step CFG 1.0 (no adapter) — the control for the strength sweep.
-        try render("base-4step-cfg1", try freshTransformer(), steps: 4, cfg: 1.0)
+        try await render("base-4step-cfg1", try freshTransformer(), steps: 4, cfg: 1.0)
 
         // Strength sweep: 1.0 = documented diffusers default (alpha/rank=0.125); higher
         // pushes the adapter. Resolves whether the small default effect is correct or weak.
         for s in [Float(1.0), 4.0, 8.0] {
             let transformer = try freshTransformer()
             try QwenImageEditLoRA.apply(diffusersLoRA: Self.lora, to: transformer, strength: s)
-            try render("lightning-4step-cfg1-s\(Int(s))", transformer, steps: 4, cfg: 1.0)
+            try await render("lightning-4step-cfg1-s\(Int(s))", transformer, steps: 4, cfg: 1.0)
         }
     }
 }

@@ -1,5 +1,5 @@
 {
-  "originHash" : "cc7ac81331c0786a1b9a207ee57a3645937c180c6ada48e4152ff6d1fbd968b8",
+  "originHash" : "f155cb3c6ee07de2d7afc0966819d05fc52c2bd2f1ffdc5a92312a70db31bb66",
   "pins" : [
     {
       "identity" : "eventsource",
@@ -15,8 +15,8 @@
       "kind" : "remoteSourceControl",
       "location" : "https://github.com/xocialize/mlx-engine-swift",
       "state" : {
-        "revision" : "0e0398b4ee3f1bd9707e10ea7024c5c35164c71e",
-        "version" : "0.10.0"
+        "revision" : "a660673c4f197665f05f522ebed21a432a9f14b7",
+        "version" : "0.15.0"
       }
     },
     {

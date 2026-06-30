@@ -27,7 +27,7 @@ import UniformTypeIdentifiers
 public let styleTransferMode = Mode(rawValue: "styleTransfer")
 
 /// Init-time configuration (C9): the BASE 2511 snapshot + the two LoRAs + DMD defaults.
-public struct TeleStyleConfiguration: PackageConfiguration, ModelStorable {
+public struct TeleStyleConfiguration: PackageConfiguration, ModelStorable, QuantConfigured {
     /// Base 2511 snapshot root with `transformer/`, `vae/`, `text_encoder/`, `processor/`.
     public var basePath: String
     /// Diffusers-format TeleStyleV2 style LoRA (.safetensors).
@@ -40,6 +40,9 @@ public struct TeleStyleConfiguration: PackageConfiguration, ModelStorable {
     public var defaultSteps: Int
     public var defaultTrueCFGScale: Float
     public var modelsRootDirectory: URL?
+
+    /// Always bf16 (same base weights as QwenImageEdit; the LoRAs add only rank factors).
+    public var quant: Quant { .bf16 }
 
     public init(
         basePath: String =
@@ -105,10 +108,18 @@ public final class TeleStylePackage: ModelPackage {
             provenance: Provenance(
                 sourceRepo: "Tele-AI/TeleStyleV2", revision: "main", tier: 1),
             requirements: RequirementsManifest(
-                // Same footprint as the QwenImageEdit base (runtime LoRAs add only small
-                // rank factors): ~60 GB resident bf16 (20B DiT + bf16 VL-7B + fp32 VAE).
-                // 4-bit is the tracked follow-up (~16 GB). DMD tier runs 4 steps.
-                footprints: [QuantFootprint(quant: .bf16, residentBytes: 60_000_000_000)],
+                // Same split as the QwenImageEdit base — same bf16 weights; the runtime LoRAs add
+                // only small rank factors to the resident DiT. Per-stage eviction (P2): the VL-7B
+                // encoder is a per-request transient, not a resident. Measured M5 Max, 1024²/8-step
+                // (QIE_MEMBENCH in MLXQwenImageEditTests): resident floor (DiT 40.9 GB + fp32 VAE
+                // 0.5 GB) = 41.4 GB; activation (peak − floor, ~16.6 GB transient encoder) ≈ 17.9 GB
+                // → 21 GB at +20% headroom. Old flat 60 GB folded the encoder into resident. DMD
+                // tier runs 4 steps; 4-bit is the Turbo int4 tier.
+                footprints: [
+                    QuantFootprint(
+                        quant: .bf16, residentBytes: 42_000_000_000,
+                        peakActivationBytes: 21_000_000_000)
+                ],
                 requiredBackends: [.metalGPU],
                 os: OSRequirement(minMacOS: SemanticVersion(major: 26, minor: 0, patch: 0)),
                 chipFloor: .max
@@ -146,7 +157,6 @@ public final class TeleStylePackage: ModelPackage {
             throw TeleStylePackageError.unreadableLoRA(lora.path)
         }
 
-        let encoder = try await QwenVLPromptEncoder.load(snapshot: base)
         let transformer = try QwenImageEditWeights.loadDiTFromPT(
             directory: base.appendingPathComponent("transformer"), dtype: .bfloat16)
         // Runtime, rank-stacked: style + Lightning together in the activation path (a bf16
@@ -157,10 +167,13 @@ public final class TeleStylePackage: ModelPackage {
                 (lightning, configuration.lightningStrength),
             ],
             to: transformer)
+        // The DiT (with the fused-runtime LoRAs) + VAE stay resident; the VL-7B encoder is
+        // loaded per request and evicted before the denoise peak (efficiency contract 1.14.0).
         let vae = try QwenImageEditWeights.loadVAE(
             directory: base.appendingPathComponent("vae"), dtype: .float32)
         generator = QwenImageEditGenerator(
-            encoder: encoder, transformer: transformer, vae: vae)
+            encoderProvider: { try await QwenVLPromptEncoder.load(snapshot: base) },
+            transformer: transformer, vae: vae)
     }
 
     public func unload() async {
@@ -179,7 +192,7 @@ public final class TeleStylePackage: ModelPackage {
         // style for styleTransfer); the core packs per-image VAE latents + grids.
         let inputs = try edit.images.map { try Self.decodeRGB($0.data) }
 
-        let (pixels, w, h) = try generator.generate(
+        let (pixels, w, h) = try await generator.generate(
             images: inputs,
             prompt: edit.prompt,
             negativePrompt: edit.negativePrompt ?? " ",
