@@ -289,6 +289,7 @@ public final class QwenImageEditTurboPackage: ModelPackage {
         registry = nil
         cache = nil
         appliedSelection = (nil, 0)
+        MLX.Memory.clearCache()   // release the retained MLX pool so eviction frees RSS (not just drop refs)
     }
 
     public func run(_ request: any CapabilityRequest) async throws -> any CapabilityResponse {
