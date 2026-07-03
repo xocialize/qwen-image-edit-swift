@@ -4,6 +4,7 @@
 
 import Foundation
 import MLX
+import MLXProfiling
 import MLXRandom
 
 public enum QwenImagePipeline {
@@ -186,6 +187,11 @@ public final class QwenImageEditGenerator {
         //    embeddings (`eval`), then drop the encoder + clear the cache BEFORE the denoise
         //    loop so the ~16 GB encoder is not co-resident with the DiT activation peak.
         let doCFG = trueCFGScale > 1
+        // Manual span (MLX_PROFILE=1) across the await — includes the per-request encoder
+        // load (evicted after; see per-stage eviction above); bounded by the `eval` below.
+        let prof = MLXProfiler.shared
+        let eSpan = prof.begin(
+            "encode", "vl", note: "per-request VL-7B load + encode\(doCFG ? " ×2 (CFG)" : "")")
         // Scope the encoder so its only strong reference is released before the denoise loop.
         var encoderRef: QwenVLPromptEncoder? = try await loadEncoder()
         let posEmbeds = try encoderRef!.encode(prompt: prompt, images: images)
@@ -194,6 +200,7 @@ public final class QwenImageEditGenerator {
         // Materialize the embeddings off the encoder graph, drop the encoder ref, then clear
         // the cache — reclaiming the ~16 GB before the DiT denoise peak.
         if let negEmbeds { eval(posEmbeds, negEmbeds) } else { eval(posEmbeds) }
+        prof.end(eSpan)
         evictEncoder(&encoderRef)
         let dtype = posEmbeds.dtype
 
@@ -201,6 +208,9 @@ public final class QwenImageEditGenerator {
         //    concatenated on the sequence axis — reference cat(all_image_latents, dim=1).
         var condParts: [MLXArray] = []
         var condShapes: [(Int, Int, Int)] = []
+        // Span note: the cond-latent graph has no eval of its own — its compute realizes at
+        // denoise step 0's eval, so this row times CPU preprocessing + graph build only.
+        let cSpan = prof.begin("vae-encode", "cond", note: "lazy — realizes at denoise step 0")
         for image in images {
             let (vw, vh) = QwenVLPromptEncoder.calculateDimensions(
                 targetArea: 1024 * 1024, ratio: Double(image.width) / Double(image.height))
@@ -221,6 +231,7 @@ public final class QwenImageEditGenerator {
         }
         let condLatents =
             condParts.count == 1 ? condParts[0] : concatenated(condParts, axis: 1)
+        prof.end(cSpan)
 
         // 3. Seeded target noise, packed.
         let key = MLXRandom.key(seed)
@@ -236,6 +247,9 @@ public final class QwenImageEditGenerator {
 
         // 5. Denoise loop (true CFG when scale > 1, else single positive pass).
         for i in 0..<steps {
+            // Manual span bounded by the loop's own per-step `eval(latents)` below.
+            let span = prof.begin(
+                "denoise", "step", index: i, note: String(format: "σ=%.3f", sigmas[i]))
             let t = MLXArray([sigmas[i]])
             let hidden = concatenated([latents, condLatents.asType(dtype)], axis: 1)
             let pos = transformer(
@@ -255,10 +269,13 @@ public final class QwenImageEditGenerator {
             }
             latents = latents + (sigmas[i + 1] - sigmas[i]) * noise
             eval(latents)
+            prof.end(span)
             progress?(i + 1, steps)
         }
 
-        // 6. Decode.
+        // 6. Decode. Manual span around the existing eval — `decode` is lazy; its compute
+        // realizes at `eval(hwc)`.
+        let dSpan = prof.begin("vae-decode", "decode")
         let unpacked = QwenImagePipeline.unpackLatents(
             latents.asType(.float32), pixelHeight: th, pixelWidth: tw)
         let decoded = vae.decode(QwenImageVAE.deNormalize(unpacked))  // (1,3,1,H,W)
@@ -267,6 +284,7 @@ public final class QwenImageEditGenerator {
         // (1,3,H,W) -> interleaved RGB8
         let hwc = img[0].transposed(1, 2, 0)
         eval(hwc)
+        prof.end(dSpan)
         return (hwc.asArray(UInt8.self), tw, th)
     }
 }

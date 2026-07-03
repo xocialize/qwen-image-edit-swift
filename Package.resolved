@@ -1,5 +1,5 @@
 {
-  "originHash" : "f155cb3c6ee07de2d7afc0966819d05fc52c2bd2f1ffdc5a92312a70db31bb66",
+  "originHash" : "b24c39da737ec41eddfb440e023377cff8b4dbfcef0d24b8e38564c026e05a1e",
   "pins" : [
     {
       "identity" : "eventsource",
@@ -17,6 +17,15 @@
       "state" : {
         "revision" : "a660673c4f197665f05f522ebed21a432a9f14b7",
         "version" : "0.15.0"
+      }
+    },
+    {
+      "identity" : "mlx-profiling",
+      "kind" : "remoteSourceControl",
+      "location" : "https://github.com/xocialize/mlx-profiling.git",
+      "state" : {
+        "revision" : "a1cee71340e28253b1796c655ac861756c87452d",
+        "version" : "0.1.0"
       }
     },
     {

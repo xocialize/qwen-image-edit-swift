@@ -17,6 +17,7 @@ import Foundation
 import ImageIO
 import MLX
 import MLXNN
+import MLXProfiling
 import MLXToolKit
 import QwenImageEdit
 import UniformTypeIdentifiers
@@ -321,15 +322,25 @@ public final class QwenImageEditTurboPackage: ModelPackage {
         try Task.checkCancellation()
         let inputs = try edit.images.map { try Self.decodeRGB($0.data) }
 
+        // Run-level MLX profiling (MLX_PROFILE=1): stage spans live in the core; the run
+        // summary normalizes to ms/step. Output size = the core's 1024²-area rule.
+        let steps = edit.steps ?? configuration.defaultSteps
+        let (tw, th) = QwenVLPromptEncoder.calculateDimensions(
+            targetArea: 1024 * 1024,
+            ratio: Double(inputs[0].width) / Double(inputs[0].height))
+        let prof = MLXProfiler.shared
+        prof.beginRun("qwen-image-edit-turbo imageEdit steps=\(steps) \(tw)x\(th)")
+
         let (pixels, w, h) = try await generator.generate(
             images: inputs,
             prompt: edit.prompt,
             negativePrompt: edit.negativePrompt ?? " ",
-            steps: edit.steps ?? configuration.defaultSteps,
+            steps: steps,
             trueCFGScale: edit.guidanceScale.map(Float.init)
                 ?? configuration.defaultTrueCFGScale,
             seed: edit.seed ?? 0,
             progress: { _, _ in })
+        prof.endRun(denominators: ["step": Double(steps)])
 
         try Task.checkCancellation()
         let png = try Self.encodePNG(pixels: pixels, width: w, height: h)
