@@ -21,6 +21,11 @@ public struct QwenImageEditConfiguration: PackageConfiguration, ModelStorable, Q
     public var snapshotPath: String
     public var defaultSteps: Int
     public var defaultTrueCFGScale: Float
+    /// Default step-residual cache level for the denoise loop (FR2 — DBCache family;
+    /// see QwenImageEdit.StepCacheMode). nil/.off = full compute every step. Requests
+    /// can override via metaData `stepCacheMode`. Opt-in until the SSIMULACRA2 ≥85
+    /// promotion gate passes.
+    public var stepCache: StepCacheMode?
     public var modelsRootDirectory: URL?
 
     /// Always bf16 (the only declared tier for the base package). Lets the memory governor
@@ -32,16 +37,18 @@ public struct QwenImageEditConfiguration: PackageConfiguration, ModelStorable, Q
             "/Volumes/DEV_VOL1/VideoResearch/qwen-image-edit-models/Qwen-Image-Edit-2511",
         defaultSteps: Int = 20,
         defaultTrueCFGScale: Float = 4.0,
+        stepCache: StepCacheMode? = nil,
         modelsRootDirectory: URL? = nil
     ) {
         self.snapshotPath = snapshotPath
         self.defaultSteps = defaultSteps
         self.defaultTrueCFGScale = defaultTrueCFGScale
+        self.stepCache = stepCache
         self.modelsRootDirectory = modelsRootDirectory
     }
 
     private enum CodingKeys: String, CodingKey {
-        case snapshotPath, defaultSteps, defaultTrueCFGScale
+        case snapshotPath, defaultSteps, defaultTrueCFGScale, stepCache
     }
 }
 
@@ -92,7 +99,9 @@ public final class QwenImageEditPackage: ModelPackage {
                     name: "qwen-image-edit",
                     summary: "Qwen-Image-Edit-2511 instruction editing (20B zero_cond_t "
                         + "DiT + Qwen2.5-VL conditioning): multi-image fusion, identity-"
-                        + "preserving edits, 1024²-area output, 20-step true CFG.",
+                        + "preserving edits, 1024²-area output, 20-step true CFG. Opt-in "
+                        + "step-residual cache via metaData stepCacheMode "
+                        + "(conservative|aggressive).",
                     modes: []
                 )
             ]
@@ -119,9 +128,12 @@ public final class QwenImageEditPackage: ModelPackage {
             directory: snapshot.appendingPathComponent("transformer"), dtype: .bfloat16)
         let vae = try QwenImageEditWeights.loadVAE(
             directory: snapshot.appendingPathComponent("vae"), dtype: .float32)
-        generator = QwenImageEditGenerator(
+        let generator = QwenImageEditGenerator(
             encoderProvider: { try await QwenVLPromptEncoder.load(snapshot: snapshot) },
             transformer: transformer, vae: vae)
+        // FR4: absorb first-forward graph/kernel build at load, not on the first edit.
+        generator.warmup()
+        self.generator = generator
     }
 
     public func unload() async {
@@ -151,6 +163,13 @@ public final class QwenImageEditPackage: ModelPackage {
         let prof = MLXProfiler.shared
         prof.beginRun("qwen-image-edit imageEdit steps=\(steps) \(tw)x\(th)")
 
+        // Step-residual cache: request metaData overrides the configured default (opt-in).
+        var stepCache = configuration.stepCache ?? .off
+        if case .string(let raw)? = edit.metaData[StepCacheMetaKeys.mode],
+            let mode = StepCacheMode(rawValue: raw)
+        {
+            stepCache = mode
+        }
         let (pixels, w, h) = try await generator.generate(
             images: inputs,
             prompt: edit.prompt,
@@ -159,6 +178,7 @@ public final class QwenImageEditPackage: ModelPackage {
             trueCFGScale: edit.guidanceScale.map(Float.init)
                 ?? configuration.defaultTrueCFGScale,
             seed: edit.seed ?? 0,
+            stepCache: stepCache,
             progress: { _, _ in })
         prof.endRun(denominators: ["step": Double(steps)])
 

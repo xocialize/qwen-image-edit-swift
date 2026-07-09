@@ -144,3 +144,26 @@ exactly (40.86 + 0.5), proving there is no full eager copy — the rebuild only 
 
 **P4 — BudgetAware: deferred.** Quant is config-chosen (bf16 vs the int4 pre-quantized tier), not a load-time
 adaptive lever; no in-variant dtype/quality knob to drive from headroom.
+
+---
+
+## Addendum 2026-07-09 — FireRed-derived levers (FIRERED-ENHANCEMENTS.md)
+
+Three inference levers landed on the shared core (all wrappers inherit):
+
+- **VL prompt-embedding memo (FR6b, audio-E1 analog).** Single-entry cache on
+  `QwenImageEditGenerator` keyed `(images hash, prompt, negative-iff-CFG)`; a hit skips the
+  per-request encoder load + encode entirely, so with evict-between-stages the ~16 GB VL-7B
+  is never even a TRANSIENT on a re-roll (same conditioning + prompts, new
+  seed/steps/guidance). Cached embeds are a few MB; dropped on `unload()`.
+- **DiT step-residual cache (FR2, DBCache Fn=8/Bn=0 + TeaCache accumulation + TaylorSeer
+  order-1).** Opt-in `StepCacheMode` (conservative 0.10 / aggressive 0.15 accumulated
+  drift budget, 3 warmup steps; separate pos/neg caches under true CFG). Adds up to two
+  Δ support points + prev-residual per branch — bounded, inside the declared 21 GB
+  activation headroom. **Gate verdict: NOT promoted** — best config scored SSIMULACRA2
+  36.6 at ~1.9× denoise (20-step true CFG has 6–11%/step deep-residual drift; the
+  redundancy assumption fails on short schedules). Stays default-off; see
+  FIRERED-ENHANCEMENTS.md FR2 for the full iteration ledger.
+- **Load-time warmup (FR4).** `generator.warmup()` (256² DiT step + VAE encode/decode)
+  in every wrapper's `load()` — first-edit latency no longer pays graph/kernel build;
+  buffers returned via `clearCache()` immediately.

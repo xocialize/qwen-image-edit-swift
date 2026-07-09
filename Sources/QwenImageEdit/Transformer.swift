@@ -475,7 +475,8 @@ public final class QwenImageTransformer2DModel: Module {
         encoderHiddenStates: MLXArray,
         encoderHiddenStatesMask: MLXArray?,
         timestep: MLXArray,
-        imgShapes: [(Int, Int, Int)]
+        imgShapes: [(Int, Int, Int)],
+        stepCache: DiTStepCache? = nil
     ) -> MLXArray {
         let batch = hiddenStates.dim(0)
         let imgLen = hiddenStates.dim(1)
@@ -513,11 +514,34 @@ public final class QwenImageTransformer2DModel: Module {
             Self.buildJointAttentionMask(textMask: $0, imgLen: imgLen).asType(hidden.dtype)
         }
 
-        for block in transformerBlocks {
+        // DBCache split (see StepCache.swift): the first `computeBlocks` always run; the
+        // deep rest are skipped when the shallow output barely moved vs the previous step,
+        // reusing the cached deep residual. `stepCache == nil` = the plain full loop.
+        let shallowCount = stepCache.map { min($0.computeBlocks, transformerBlocks.count) }
+            ?? transformerBlocks.count
+        let blockInput = hidden
+        for block in transformerBlocks[..<shallowCount] {
             (encoder, hidden) = block(
                 hiddenStates: hidden, encoderHiddenStates: encoder, temb: temb,
                 imageRotaryEmb: imageRotaryEmb, attentionMask: attentionMask,
                 modulateIndex: modulateIndex)
+        }
+        if let stepCache {
+            let shallow = hidden
+            let sigma = timestep[0].item(Float.self)
+            if let reused = stepCache.reuse(
+                shallow: shallow, residual: shallow - blockInput, sigma: sigma)
+            {
+                hidden = reused
+            } else {
+                for block in transformerBlocks[shallowCount...] {
+                    (encoder, hidden) = block(
+                        hiddenStates: hidden, encoderHiddenStates: encoder, temb: temb,
+                        imageRotaryEmb: imageRotaryEmb, attentionMask: attentionMask,
+                        modulateIndex: modulateIndex)
+                }
+                stepCache.store(shallow: shallow, deep: hidden, sigma: sigma)
+            }
         }
 
         // norm_out modulates with the real-t temb only (reference L969-970).

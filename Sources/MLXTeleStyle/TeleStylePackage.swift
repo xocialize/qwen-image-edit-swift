@@ -172,9 +172,13 @@ public final class TeleStylePackage: ModelPackage {
         // loaded per request and evicted before the denoise peak (efficiency contract 1.14.0).
         let vae = try QwenImageEditWeights.loadVAE(
             directory: base.appendingPathComponent("vae"), dtype: .float32)
-        generator = QwenImageEditGenerator(
+        let generator = QwenImageEditGenerator(
             encoderProvider: { try await QwenVLPromptEncoder.load(snapshot: base) },
             transformer: transformer, vae: vae)
+        // FR4: absorb first-forward graph/kernel build (incl. the runtime-LoRA path)
+        // at load, not on the first edit.
+        generator.warmup()
+        self.generator = generator
     }
 
     public func unload() async {

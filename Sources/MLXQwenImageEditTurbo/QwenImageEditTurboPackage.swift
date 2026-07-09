@@ -67,6 +67,11 @@ public struct QwenImageEditTurboConfiguration: PackageConfiguration, ModelStorab
     public var lowPrecisionVAE: Bool
     public var defaultSteps: Int
     public var defaultTrueCFGScale: Float
+    /// Default step-residual cache level (FR2 — DBCache family; see
+    /// QwenImageEdit.StepCacheMode). nil/.off = full compute. Requests override via
+    /// metaData `stepCacheMode`. NB the 4-step DMD default leaves only 1 skippable step
+    /// after the 3-step warmup — the cache pays off at higher step counts.
+    public var stepCache: StepCacheMode?
     public var modelsRootDirectory: URL?
 
     /// The selected DiT tier: int4 when the DiT loads (or quantizes) to 4-bit, else bf16.
@@ -92,6 +97,7 @@ public struct QwenImageEditTurboConfiguration: PackageConfiguration, ModelStorab
         lowPrecisionVAE: Bool = false,
         defaultSteps: Int = 4,
         defaultTrueCFGScale: Float = 1.0,
+        stepCache: StepCacheMode? = nil,
         modelsRootDirectory: URL? = nil
     ) {
         self.snapshotPath = snapshotPath
@@ -105,13 +111,14 @@ public struct QwenImageEditTurboConfiguration: PackageConfiguration, ModelStorab
         self.lowPrecisionVAE = lowPrecisionVAE
         self.defaultSteps = defaultSteps
         self.defaultTrueCFGScale = defaultTrueCFGScale
+        self.stepCache = stepCache
         self.modelsRootDirectory = modelsRootDirectory
     }
 
     private enum CodingKeys: String, CodingKey {
         case snapshotPath, loraPath, strength, ditBits, encoderBits, modulationBits
         case quantizedDiTPath, quantizedEncoderPath, lowPrecisionVAE
-        case defaultSteps, defaultTrueCFGScale
+        case defaultSteps, defaultTrueCFGScale, stepCache
     }
 }
 
@@ -180,7 +187,8 @@ public final class QwenImageEditTurboPackage: ModelPackage {
                         + "applied at runtime over the 20B DiT. Optional community effect LoRA "
                         + "per request (metaData loraId/loraStrength, hot-swapped, lazy-cached "
                         + "from the bundled registry). Multi-image fusion, identity-preserving "
-                        + "edits, 1024²-area output, 4-step single-pass.",
+                        + "edits, 1024²-area output, 4-step single-pass. Opt-in step-residual "
+                        + "cache via metaData stepCacheMode (conservative|aggressive).",
                     modes: [turboMode]
                 )
             ]
@@ -275,13 +283,17 @@ public final class QwenImageEditTurboPackage: ModelPackage {
         let vae = try QwenImageEditWeights.loadVAE(
             directory: snapshot.appendingPathComponent("vae"),
             dtype: configuration.lowPrecisionVAE ? .bfloat16 : .float32)
-        generator = QwenImageEditGenerator(
+        let generator = QwenImageEditGenerator(
             encoderProvider: {
                 try await QwenVLPromptEncoder.load(
                     snapshot: snapshot, bits: encoderBits,
                     quantizedTextModelPath: quantizedEncoderPath)
             },
             transformer: transformer, vae: vae)
+        // FR4: absorb first-forward graph/kernel build (incl. the QLoRA/quantized-matmul
+        // paths riding the resident DiT) at load, not on the first edit.
+        generator.warmup()
+        self.generator = generator
     }
 
     public func unload() async {
@@ -331,6 +343,10 @@ public final class QwenImageEditTurboPackage: ModelPackage {
         let prof = MLXProfiler.shared
         prof.beginRun("qwen-image-edit-turbo imageEdit steps=\(steps) \(tw)x\(th)")
 
+        // Step-residual cache: request metaData overrides the configured default (opt-in).
+        let stepCache = edit.metaData[StepCacheMetaKeys.mode]?.asString
+            .flatMap(StepCacheMode.init(rawValue:))
+            ?? configuration.stepCache ?? .off
         let (pixels, w, h) = try await generator.generate(
             images: inputs,
             prompt: edit.prompt,
@@ -339,6 +355,7 @@ public final class QwenImageEditTurboPackage: ModelPackage {
             trueCFGScale: edit.guidanceScale.map(Float.init)
                 ?? configuration.defaultTrueCFGScale,
             seed: edit.seed ?? 0,
+            stepCache: stepCache,
             progress: { _, _ in })
         prof.endRun(denominators: ["step": Double(steps)])
 

@@ -90,6 +90,37 @@ public final class QwenImageEditGenerator {
     /// Hot encoder when `keepEncoderResident` is set (avoids the reload each request).
     private var residentEncoder: QwenVLPromptEncoder?
 
+    /// Single-entry VL prompt-embedding memo (FR6b — same shape as `cachedClonePrompt`
+    /// in Qwen3TTSPackage). Iterative-editing UX (same conditioning images + prompts,
+    /// new seed/steps/guidance) re-pays the VL encode — and, worse, the per-request
+    /// ~16 GB encoder load — every re-roll. A hit skips `loadEncoder` entirely, so with
+    /// evict-between-stages the 7B encoder never becomes resident for a re-roll. The
+    /// cached embeddings are a few MB (1×S×3584 bf16). Dropped with the generator on
+    /// package unload().
+    private struct PromptCacheKey: Equatable {
+        var imagesHash: Int
+        var prompt: String
+        /// nil when the request runs CFG-free (no negative branch encoded).
+        var negativePrompt: String?
+    }
+    private var cachedPromptEmbeds: (key: PromptCacheKey, pos: MLXArray, neg: MLXArray?)?
+
+    /// Diagnostics from the last generate(): denoise steps skipped by the step-residual
+    /// cache per CFG branch (nil when the cache was off). For eval harnesses/telemetry.
+    public private(set) var lastStepCacheSkips: (pos: Int, neg: Int)?
+
+    private static func hashImages(_ images: [(rgb: [UInt8], width: Int, height: Int)])
+        -> Int
+    {
+        var hasher = Hasher()
+        for image in images {
+            hasher.combine(image.width)
+            hasher.combine(image.height)
+            image.rgb.withUnsafeBytes { hasher.combine(bytes: $0) }
+        }
+        return hasher.finalize()
+    }
+
     /// Staged init: the encoder is loaded on demand via `encoderProvider`, not held resident.
     public init(
         encoderProvider: @escaping () async throws -> QwenVLPromptEncoder,
@@ -135,6 +166,40 @@ public final class QwenImageEditGenerator {
         Memory.clearCache()     // return the freed buffers to the OS before denoise
     }
 
+    /// Build/execute the first-forward graphs at load time (FR4) so the first user edit
+    /// doesn't pay kernel/graph build: one small DiT step with the real shape family
+    /// (target grid + one conditioning grid, so the zero_cond_t modulateIndex path is
+    /// warmed) plus a VAE encode + decode, all at 256². The VL encoder is deliberately
+    /// NOT warmed — it loads per request (evict-between-stages), so a load-time warmup
+    /// would pay the ~16 GB transient for nothing.
+    public func warmup(isolation: isolated (any Actor)? = #isolation) {
+        let dtype: DType = .bfloat16
+        let side = 256
+        let latentSide = side / 8
+        let prof = MLXProfiler.shared
+        let span = prof.begin(
+            "warmup", "first-forward", note: "256² DiT step + VAE encode/decode at load")
+
+        let condPixels = MLXArray.zeros([1, 3, 1, side, side]).asType(dtype)
+        let cond = QwenImagePipeline.packLatents(vae.encode(condPixels))
+        let latents = QwenImagePipeline.packLatents(
+            MLXArray.zeros([1, 16, 1, latentSide, latentSide]).asType(dtype))
+        let hidden = concatenated([latents, cond.asType(dtype)], axis: 1)
+        let txt = MLXArray.zeros([1, 32, 3584]).asType(dtype)
+        let grid = (1, latentSide / 2, latentSide / 2)
+        let noise = transformer(
+            hiddenStates: hidden, encoderHiddenStates: txt,
+            encoderHiddenStatesMask: nil, timestep: MLXArray([Float(1)]),
+            imgShapes: [grid, grid]
+        )[0..., ..<latents.dim(1)]
+        let unpacked = QwenImagePipeline.unpackLatents(
+            noise.asType(.float32), pixelHeight: side, pixelWidth: side)
+        let decoded = vae.decode(QwenImageVAE.deNormalize(unpacked))
+        eval(decoded)
+        prof.end(span)
+        Memory.clearCache()  // return the warmup buffers before real requests
+    }
+
     /// Edit a single `image` per `prompt`. Returns interleaved RGB8 + dimensions.
     /// Thin wrapper over the multi-image core (`generate(images:)`).
     public func generate(
@@ -144,12 +209,14 @@ public final class QwenImageEditGenerator {
         steps: Int = 20,
         trueCFGScale: Float = 4.0,
         seed: UInt64 = 0,
+        stepCache: StepCacheMode = .off,
         progress: ((Int, Int) -> Void)? = nil,
         isolation: isolated (any Actor)? = #isolation
     ) async throws -> (pixels: [UInt8], width: Int, height: Int) {
         try await generate(
             images: [image], prompt: prompt, negativePrompt: negativePrompt,
-            steps: steps, trueCFGScale: trueCFGScale, seed: seed, progress: progress)
+            steps: steps, trueCFGScale: trueCFGScale, seed: seed, stepCache: stepCache,
+            progress: progress)
     }
 
     /// Multi-image edit / style transfer. Images are conditioning inputs in prompt
@@ -168,6 +235,7 @@ public final class QwenImageEditGenerator {
         steps: Int = 20,
         trueCFGScale: Float = 4.0,
         seed: UInt64 = 0,
+        stepCache: StepCacheMode = .off,
         progress: ((Int, Int) -> Void)? = nil,
         isolation: isolated (any Actor)? = #isolation
     ) async throws -> (pixels: [UInt8], width: Int, height: Int) {
@@ -187,21 +255,36 @@ public final class QwenImageEditGenerator {
         //    embeddings (`eval`), then drop the encoder + clear the cache BEFORE the denoise
         //    loop so the ~16 GB encoder is not co-resident with the DiT activation peak.
         let doCFG = trueCFGScale > 1
-        // Manual span (MLX_PROFILE=1) across the await — includes the per-request encoder
-        // load (evicted after; see per-stage eviction above); bounded by the `eval` below.
         let prof = MLXProfiler.shared
-        let eSpan = prof.begin(
-            "encode", "vl", note: "per-request VL-7B load + encode\(doCFG ? " ×2 (CFG)" : "")")
-        // Scope the encoder so its only strong reference is released before the denoise loop.
-        var encoderRef: QwenVLPromptEncoder? = try await loadEncoder()
-        let posEmbeds = try encoderRef!.encode(prompt: prompt, images: images)
-        let negEmbeds =
-            doCFG ? try encoderRef!.encode(prompt: negativePrompt, images: images) : nil
-        // Materialize the embeddings off the encoder graph, drop the encoder ref, then clear
-        // the cache — reclaiming the ~16 GB before the DiT denoise peak.
-        if let negEmbeds { eval(posEmbeds, negEmbeds) } else { eval(posEmbeds) }
-        prof.end(eSpan)
-        evictEncoder(&encoderRef)
+        // Prompt-embedding memo (FR6b): a hit skips the per-request encoder load + encode
+        // entirely — the 7B encoder never becomes resident for a re-roll.
+        let promptKey = PromptCacheKey(
+            imagesHash: Self.hashImages(images), prompt: prompt,
+            negativePrompt: doCFG ? negativePrompt : nil)
+        let posEmbeds: MLXArray
+        let negEmbeds: MLXArray?
+        if let cached = cachedPromptEmbeds, cached.key == promptKey {
+            posEmbeds = cached.pos
+            negEmbeds = cached.neg
+        } else {
+            // Manual span (MLX_PROFILE=1) across the await — includes the per-request encoder
+            // load (evicted after; see per-stage eviction above); bounded by the `eval` below.
+            let eSpan = prof.begin(
+                "encode", "vl",
+                note: "per-request VL-7B load + encode\(doCFG ? " ×2 (CFG)" : "")")
+            // Scope the encoder so its only strong reference is released before the denoise
+            // loop.
+            var encoderRef: QwenVLPromptEncoder? = try await loadEncoder()
+            posEmbeds = try encoderRef!.encode(prompt: prompt, images: images)
+            negEmbeds =
+                doCFG ? try encoderRef!.encode(prompt: negativePrompt, images: images) : nil
+            // Materialize the embeddings off the encoder graph, drop the encoder ref, then
+            // clear the cache — reclaiming the ~16 GB before the DiT denoise peak.
+            if let negEmbeds { eval(posEmbeds, negEmbeds) } else { eval(posEmbeds) }
+            prof.end(eSpan)
+            evictEncoder(&encoderRef)
+            cachedPromptEmbeds = (promptKey, posEmbeds, negEmbeds)
+        }
         let dtype = posEmbeds.dtype
 
         // 2. Per-image VAE conditioning latents (each at its own 1024²-area /32 size),
@@ -246,6 +329,12 @@ public final class QwenImageEditGenerator {
         let targetLen = latents.dim(1)
 
         // 5. Denoise loop (true CFG when scale > 1, else single positive pass).
+        // Step-residual caching (FR2, opt-in): pos and neg run as separate forwards, so
+        // each CFG branch gets its OWN cache. Cache state lives only for this loop; the
+        // retained arrays (prev shallow + deep residual per branch) are activation-sized
+        // and counted under the declared peakActivationBytes headroom.
+        let posStepCache = stepCache.threshold.map { DiTStepCache(threshold: $0) }
+        let negStepCache = doCFG ? stepCache.threshold.map { DiTStepCache(threshold: $0) } : nil
         for i in 0..<steps {
             // Manual span bounded by the loop's own per-step `eval(latents)` below.
             let span = prof.begin(
@@ -254,13 +343,15 @@ public final class QwenImageEditGenerator {
             let hidden = concatenated([latents, condLatents.asType(dtype)], axis: 1)
             let pos = transformer(
                 hiddenStates: hidden, encoderHiddenStates: posEmbeds,
-                encoderHiddenStatesMask: nil, timestep: t, imgShapes: imgShapes
+                encoderHiddenStatesMask: nil, timestep: t, imgShapes: imgShapes,
+                stepCache: posStepCache
             )[0..., ..<targetLen]
             let noise: MLXArray
             if let negEmbeds {
                 let neg = transformer(
                     hiddenStates: hidden, encoderHiddenStates: negEmbeds,
-                    encoderHiddenStatesMask: nil, timestep: t, imgShapes: imgShapes
+                    encoderHiddenStatesMask: nil, timestep: t, imgShapes: imgShapes,
+                    stepCache: negStepCache
                 )[0..., ..<targetLen]
                 noise = QwenImagePipeline.guidedNoise(
                     pos: pos, neg: neg, scale: trueCFGScale)
@@ -272,6 +363,8 @@ public final class QwenImageEditGenerator {
             prof.end(span)
             progress?(i + 1, steps)
         }
+        lastStepCacheSkips = (posStepCache != nil || negStepCache != nil)
+            ? (posStepCache?.skippedSteps ?? 0, negStepCache?.skippedSteps ?? 0) : nil
 
         // 6. Decode. Manual span around the existing eval — `decode` is lazy; its compute
         // realizes at `eval(hwc)`.
