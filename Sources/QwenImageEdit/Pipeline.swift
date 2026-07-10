@@ -286,6 +286,8 @@ public final class QwenImageEditGenerator {
             cachedPromptEmbeds = (promptKey, posEmbeds, negEmbeds)
         }
         let dtype = posEmbeds.dtype
+        // CAN seam: prompt encoding done (encoder evicted), before conditioning + denoise.
+        try Task.checkCancellation()
 
         // 2. Per-image VAE conditioning latents (each at its own 1024²-area /32 size),
         //    concatenated on the sequence axis — reference cat(all_image_latents, dim=1).
@@ -336,6 +338,9 @@ public final class QwenImageEditGenerator {
         let posStepCache = stepCache.threshold.map { DiTStepCache(threshold: $0) }
         let negStepCache = doCFG ? stepCache.threshold.map { DiTStepCache(threshold: $0) } : nil
         for i in 0..<steps {
+            // CAN cadence: cooperative cancellation once per denoise step (throwing seam —
+            // the CancellationError unwinds unchanged to the engine wrapper's run()).
+            try Task.checkCancellation()
             // Manual span bounded by the loop's own per-step `eval(latents)` below.
             let span = prof.begin(
                 "denoise", "step", index: i, note: String(format: "σ=%.3f", sigmas[i]))
@@ -365,6 +370,9 @@ public final class QwenImageEditGenerator {
         }
         lastStepCacheSkips = (posStepCache != nil || negStepCache != nil)
             ? (posStepCache?.skippedSteps ?? 0, negStepCache?.skippedSteps ?? 0) : nil
+
+        // CAN seam: denoise done, before the monolithic VAE decode (one MLX eval).
+        try Task.checkCancellation()
 
         // 6. Decode. Manual span around the existing eval — `decode` is lazy; its compute
         // realizes at `eval(hwc)`.

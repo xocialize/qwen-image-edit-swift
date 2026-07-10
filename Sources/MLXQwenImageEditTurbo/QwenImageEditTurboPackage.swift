@@ -306,6 +306,11 @@ public final class QwenImageEditTurboPackage: ModelPackage {
     }
 
     public func run(_ request: any CapabilityRequest) async throws -> any CapabilityResponse {
+        // CAN-1: the entry checkpoint is the FIRST act of run() — before notLoaded validation
+        // (engine ≥ 0.27.0). Mid-run cadence lives in the shared core (QwenImageEditGenerator
+        // .generate: post-encode seam, per-denoise-step checkpoint, pre-decode seam);
+        // CancellationError is rethrown unchanged (incl. through LoRACache.ensure below).
+        try Task.checkCancellation()
         guard let generator, let swapper, let lightningURL else { throw PackageError.notLoaded }
         guard request.capability == .imageEdit, let edit = request as? IEditRequest else {
             throw PackageError.unsupportedCapability(request.capability)

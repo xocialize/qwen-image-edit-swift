@@ -29,8 +29,9 @@ let package = Package(
         .package(url: "https://github.com/huggingface/swift-transformers", from: "1.1.6"),
         // VL encoder backbone + HF-exact image preprocessing (parity-locked); net dep.
         .package(url: "https://github.com/xocialize/qwen25vl-mlx-swift", from: "0.1.0"),
-        // MLXEngine contract (MLXToolKit) for the wrapper target only.
-        .package(url: "https://github.com/xocialize/mlx-engine-swift", from: "0.3.0"),
+        // MLXEngine contract (MLXToolKit) for the wrapper target only. ≥0.27.0 for the CAN
+        // cancellation gate (MLXServeConformance.CancellationConformance).
+        .package(url: "https://github.com/xocialize/mlx-engine-swift", from: "0.27.0"),
         // Shared env-gated perf instrument (MLX_PROFILE=1); zero overhead when unset.
         .package(url: "https://github.com/xocialize/mlx-profiling.git", from: "0.1.0"),
     ],
@@ -91,17 +92,25 @@ let package = Package(
                 // split-footprint mem-bench needs the core generator + MLX peak APIs directly.
                 "QwenImageEdit",
                 .product(name: "MLX", package: "mlx-swift"),
+                // The engine's executable CAN gate, run from this package's own suite.
+                .product(name: "MLXServeConformance", package: "mlx-engine-swift"),
             ],
             path: "Tests/MLXQwenImageEditTests"
         ),
         .testTarget(
             name: "MLXTeleStyleTests",
-            dependencies: ["MLXTeleStyle"],
+            dependencies: [
+                "MLXTeleStyle",
+                .product(name: "MLXServeConformance", package: "mlx-engine-swift"),
+            ],
             path: "Tests/MLXTeleStyleTests"
         ),
         .testTarget(
             name: "MLXQwenImageEditTurboTests",
-            dependencies: ["MLXQwenImageEditTurbo"],
+            dependencies: [
+                "MLXQwenImageEditTurbo",
+                .product(name: "MLXServeConformance", package: "mlx-engine-swift"),
+            ],
             path: "Tests/MLXQwenImageEditTurboTests"
         ),
     ]

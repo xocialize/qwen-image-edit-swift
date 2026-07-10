@@ -87,6 +87,10 @@ public struct LoRACache: Sendable {
             try? FileManager.default.removeItem(at: dest)
             try FileManager.default.moveItem(at: tmp, to: dest)
             return dest
+        } catch is CancellationError {
+            // CAN-2: never launder a cancellation into LoRARegistryError — the engine's lane
+            // disambiguation and the caller's .cancelled classification key on the type.
+            throw CancellationError()
         } catch let e as LoRARegistryError {
             throw e
         } catch {
