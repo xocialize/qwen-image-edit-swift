@@ -65,7 +65,8 @@ final class EncoderBisectTests: XCTestCase {
         let encoder = try await QwenVLPromptEncoder.load(
             snapshot: Self.modelDir, dtype: fp32CPU ? .float32 : .bfloat16)
         let visionDtype: DType = fp32CPU ? .float32 : .bfloat16
-        let ourFeatures = encoder.vision(
+        // `load` always builds the ViT (only `loadTextOnly` leaves it nil).
+        let ourFeatures = try XCTUnwrap(encoder.vision)(
             refPixels.asType(visionDtype), frames: [frame])
         let refVisual = stages["visual_merged"] ?? stages["visual_features"]!
         if ourFeatures.shape == refVisual.shape {

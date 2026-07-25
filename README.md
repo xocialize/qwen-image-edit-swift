@@ -15,6 +15,19 @@ style transfer** (TeleStyleV2).
 - **`MLXQwenImageEdit`** — the thin MLXEngine wrapper (`QwenImageEditPackage`, PackageID
   `qwen-image-edit`): the canonical `IEditRequest`/`IEditResponse` surface, multi-image, license
   declaration, requirements manifest, and PNG artifact encoding.
+- **`MLXQwenImageFlash`** — [nvidia/Qwen-Image-Flash](https://huggingface.co/nvidia/Qwen-Image-Flash)
+  **text-to-image** (`QwenImageFlashPackage`, PackageID `qwen-image-flash`): NVIDIA's DMD2
+  4-step distill of Qwen-Image on the same core's T2I path (`QwenImageT2IGenerator`). The
+  distilled checkpoint is a pure weight delta — the transformer key set is identical to
+  2511's (1933 tensors) and the text encoder / tokenizer / VAE files are byte-identical
+  (sha256-verified) — so the port is the T2I *pipeline* delta only: text-only prompt encoding
+  (template drop_idx 34, not 64), no conditioning latents, and the packaged **static** shift-3
+  schedule (`use_dynamic_shifting: false`) giving sigmas `[1.0, 0.9, 0.75, 0.5, 0.0]`.
+  Guidance was internalized by the distillation, so it runs true CFG 1.0 — one DiT forward
+  per step. Weights: NVIDIA Open Model License (commercially permissive; redistributing the
+  weights requires shipping the Agreement + the "Licensed by NVIDIA Corporation under the
+  NVIDIA Open Model License" notice) with Apache-2.0 as additional information.
+
 - **`MLXTeleStyle`** — [TeleStyleV2](https://github.com/Tele-AI/TeleStyleV2) content-preserving
   **style transfer** (`TeleStylePackage`, PackageID `telestyle-v2`): the `imageEdit` surface with a
   **`styleTransfer` mode** (image 0 = content, image 1 = style). Same `QwenImageEdit` core over a

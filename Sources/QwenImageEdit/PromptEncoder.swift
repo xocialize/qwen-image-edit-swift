@@ -24,7 +24,8 @@ import Tokenizers
 
 public final class QwenVLPromptEncoder {
     public let model: Qwen25VLModel
-    public let vision: QVLVision.VisionModel
+    /// nil on the text-only (T2I) path — `loadTextOnly` skips the ViT entirely.
+    public let vision: QVLVision.VisionModel?
     public let tokenizer: any Tokenizers.Tokenizer
     let imagePadId: Int
     let minPixels: Int
@@ -43,8 +44,20 @@ public final class QwenVLPromptEncoder {
     static let dropIdx = 64
     public static let conditionImageArea = 384 * 384
 
+    /// pipeline_qwenimage.py L176-177 — the text-to-image template (no image block);
+    /// tokenizes to exactly 34 tokens, hence `t2iDropIdx`.
+    static let t2iTemplatePrefix =
+        "<|im_start|>system\n"
+        + "Describe the image by detailing the color, shape, size, texture, quantity, text, "
+        + "spatial relationships of the objects and background:"
+        + "<|im_end|>\n<|im_start|>user\n"
+    static let t2iDropIdx = 34
+    /// pipeline_qwenimage.py `__call__(max_sequence_length: int = 512)`; the checker caps
+    /// it at 1024.
+    public static let t2iMaxSequenceLength = 512
+
     public init(
-        model: Qwen25VLModel, vision: QVLVision.VisionModel,
+        model: Qwen25VLModel, vision: QVLVision.VisionModel?,
         tokenizer: any Tokenizers.Tokenizer, minPixels: Int, maxPixels: Int,
         dtype: DType = .bfloat16
     ) throws {
@@ -54,10 +67,13 @@ public final class QwenVLPromptEncoder {
         self.minPixels = minPixels
         self.maxPixels = maxPixels
         self.dtype = dtype
-        guard let pad = tokenizer.convertTokenToId("<|image_pad|>") else {
+        // The pad id is only consumed by the image branch; a text-only encoder tolerates a
+        // tokenizer without it.
+        let pad = tokenizer.convertTokenToId("<|image_pad|>")
+        if vision != nil, pad == nil {
             throw QwenImageEditError.loading("tokenizer lacks <|image_pad|>")
         }
-        self.imagePadId = pad
+        self.imagePadId = pad ?? -1
     }
 
     /// Load from a 2511 snapshot root (`text_encoder/` + `processor/`).
@@ -146,6 +162,65 @@ public final class QwenVLPromptEncoder {
             minPixels: processor.minPixels, maxPixels: processor.maxPixels, dtype: dtype)
     }
 
+    /// Load the TEXT-ONLY encoder from a T2I snapshot root (`text_encoder/` + `tokenizer/`).
+    ///
+    /// The diffusers `QwenImagePipeline` conditions on text alone, so the ViT is never
+    /// invoked: this skips `visual.*` at load (never materialized — not loaded then freed)
+    /// and reads the plain `tokenizer/` folder, since a T2I snapshot ships no `processor/`.
+    /// `minPixels`/`maxPixels` are unused on this path and carry the HF processor defaults.
+    public static func loadTextOnly(
+        snapshot: URL, dtype: DType = .bfloat16, bits: Int? = nil,
+        quantizedTextModelPath: String? = nil
+    ) async throws -> QwenVLPromptEncoder {
+        let encoderDir = snapshot.appendingPathComponent("text_encoder")
+        // T2I snapshots ship `tokenizer/`; fall back to `processor/` so an edit snapshot
+        // also works as a source.
+        let fm = FileManager.default
+        var tokenizerDir = snapshot.appendingPathComponent("tokenizer")
+        if !fm.fileExists(atPath: tokenizerDir.path) {
+            tokenizerDir = snapshot.appendingPathComponent("processor")
+        }
+
+        let configData = try Data(contentsOf: encoderDir.appendingPathComponent("config.json"))
+        var configJSON = try JSONSerialization.jsonObject(with: configData) as! [String: Any]
+        configJSON["tie_word_embeddings"] = true
+        let textConfig = try JSONDecoder().decode(
+            Qwen25VLTextConfig.self,
+            from: JSONSerialization.data(withJSONObject: configJSON))
+        let model = Qwen25VLModel(textConfig)
+
+        let needBf16LLM = quantizedTextModelPath == nil
+        if needBf16LLM {
+            let files = try fm.contentsOfDirectory(at: encoderDir, includingPropertiesForKeys: nil)
+                .filter { $0.pathExtension == "safetensors" }
+                .sorted { $0.lastPathComponent < $1.lastPathComponent }
+            var llm: [String: MLXArray] = [:]
+            for f in files {
+                for (k, v) in try MLX.loadArrays(url: f) {
+                    guard k.hasPrefix("model.") else { continue }  // skip visual.* / lm_head
+                    llm[String(k.dropFirst("model.".count))] = v.asType(dtype)
+                }
+            }
+            try QwenImageEditWeights.verifyAndLoad(model: model, weights: llm, label: "VL-7B(text)")
+            if let bits {
+                quantize(model: model, groupSize: 64, bits: bits)
+                eval(model)  // materialize the quantized weights + free the bf16 originals
+            }
+        } else if let qpath = quantizedTextModelPath {
+            let (qw, meta) = try MLX.loadArraysAndMetadata(url: URL(fileURLWithPath: qpath))
+            let qbits = meta["bits"].flatMap(Int.init) ?? 4
+            let qgs = meta["group_size"].flatMap(Int.init) ?? 64
+            quantize(model: model, groupSize: qgs, bits: qbits)
+            try QwenImageEditWeights.verifyAndLoad(
+                model: model, weights: qw, label: "VL-7B(text,int\(qbits))")
+        }
+
+        let tokenizer = try await AutoTokenizer.from(modelFolder: tokenizerDir)
+        return try QwenVLPromptEncoder(
+            model: model, vision: nil, tokenizer: tokenizer,
+            minPixels: 4 * 28 * 28, maxPixels: 16384 * 28 * 28, dtype: dtype)
+    }
+
     /// One-time conversion: quantize the VL-7B text model and save it as a self-describing
     /// safetensors. Consumers then pass it to `load(quantizedTextModelPath:)` to skip the
     /// bf16 LLM load (and its peak). The small ViT still comes bf16 from the snapshot.
@@ -188,11 +263,46 @@ public final class QwenVLPromptEncoder {
         return (w32, h32)
     }
 
+    /// Encode a prompt with NO conditioning image -> (1, S, 3584) embeddings — the
+    /// diffusers `QwenImagePipeline._get_qwen_prompt_embeds` path: T2I template, causal
+    /// forward over the text tokens, `hidden_states[-1]` stripped of the 34-token system
+    /// block, then truncated to `maxSequenceLength`.
+    ///
+    /// Works on a text-only encoder (`loadTextOnly`) and on a full edit encoder alike —
+    /// the ViT is simply never invoked.
+    public func encodeText(
+        prompt: String, maxSequenceLength: Int = QwenVLPromptEncoder.t2iMaxSequenceLength
+    ) throws -> MLXArray {
+        guard maxSequenceLength <= 1024 else {
+            throw QwenImageEditError.invalidInput(
+                "maxSequenceLength cannot be greater than 1024 but is \(maxSequenceLength)")
+        }
+        let text = Self.t2iTemplatePrefix + prompt + Self.promptTemplateSuffix
+        var ids = tokenizer.encode(text: text, addSpecialTokens: false)
+        // Reference tokenizer call: max_length = tokenizer_max_length (1024) + drop_idx.
+        if ids.count > 1024 + Self.t2iDropIdx { ids = Array(ids.prefix(1024 + Self.t2iDropIdx)) }
+
+        let inputIds = MLXArray(ids.map { Int32($0) }).expandedDimensions(axis: 0)
+        let embeds = model.embedTokens(inputIds)
+        // Text-only: plain sequential positions on all three mRoPE axes (see the note in
+        // `encode` — the reference runs the VL model without mm_token_type_ids).
+        let positionIds = Self.sequentialPositionIds(count: ids.count)
+        let hidden = model(
+            inputEmbeddings: embeds, positionIds: positionIds, mask: .causal, caches: nil)
+        let dropped = hidden[0..., Self.t2iDropIdx..., 0...]
+        let keep = min(dropped.dim(1), maxSequenceLength)
+        return dropped[0..., ..<keep, 0...]
+    }
+
     /// Encode (prompt, conditioning images) -> (1, S, 3584) prompt embeddings, the
     /// drop_idx-stripped last hidden state. Images are interleaved RGB8 buffers.
     public func encode(
         prompt: String, images: [(rgb: [UInt8], width: Int, height: Int)]
     ) throws -> MLXArray {
+        guard let vision else {
+            throw QwenImageEditError.invalidInput(
+                "this encoder was loaded text-only (no ViT); use encodeText(prompt:)")
+        }
         // 1. Conditioning resize chain per image: LANCZOS to 384²-area /32 size.
         var processed: [(MLXArray, THW)] = []
         for image in images {

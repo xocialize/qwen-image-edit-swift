@@ -22,6 +22,9 @@ let package = Package(
         // Fast/low-step tier: Lightning 4-step DMD LoRA applied at runtime (imageEdit +
         // turbo mode) on the same QwenImageEdit core.
         .library(name: "MLXQwenImageEditTurbo", targets: ["MLXQwenImageEditTurbo"]),
+        // Qwen-Image-Flash: NVIDIA's DMD2 4-step T2I distill of Qwen-Image, driving the same
+        // core's text-to-image path (`textToImage`, not `imageEdit`).
+        .library(name: "MLXQwenImageFlash", targets: ["MLXQwenImageFlash"]),
     ],
     dependencies: [
         .package(url: "https://github.com/ml-explore/mlx-swift.git", from: "0.30.0"),
@@ -29,9 +32,12 @@ let package = Package(
         .package(url: "https://github.com/huggingface/swift-transformers", from: "1.1.6"),
         // VL encoder backbone + HF-exact image preprocessing (parity-locked); net dep.
         .package(url: "https://github.com/xocialize/qwen25vl-mlx-swift", from: "0.1.0"),
-        // MLXEngine contract (MLXToolKit) for the wrapper target only. ≥0.27.0 for the CAN
-        // cancellation gate (MLXServeConformance.CancellationConformance).
-        .package(url: "https://github.com/xocialize/mlx-engine-swift", from: "0.27.0"),
+        // MLXEngine contract (MLXToolKit) for the wrapper targets only. ≥0.27.0 for the CAN
+        // cancellation gate (MLXServeConformance.CancellationConformance); ≥0.32.0 for
+        // engine-executed materialization (contract 1.24: WeightSourcing +
+        // resolvedSnapshotDirectory) and the allowlisted NVIDIA Open Model License, both
+        // required by MLXQwenImageFlash.
+        .package(url: "https://github.com/xocialize/mlx-engine-swift", from: "0.32.0"),
         // Shared env-gated perf instrument (MLX_PROFILE=1); zero overhead when unset.
         .package(url: "https://github.com/xocialize/mlx-profiling.git", from: "0.1.0"),
     ],
@@ -80,6 +86,15 @@ let package = Package(
             path: "Sources/MLXQwenImageEditTurbo",
             resources: [.process("Resources")]
         ),
+        .target(
+            name: "MLXQwenImageFlash",
+            dependencies: [
+                "QwenImageEdit",
+                .product(name: "MLXToolKit", package: "mlx-engine-swift"),
+                .product(name: "MLXProfiling", package: "mlx-profiling"),
+            ],
+            path: "Sources/MLXQwenImageFlash"
+        ),
         .testTarget(
             name: "QwenImageEditTests",
             dependencies: ["QwenImageEdit"],
@@ -112,6 +127,17 @@ let package = Package(
                 .product(name: "MLXServeConformance", package: "mlx-engine-swift"),
             ],
             path: "Tests/MLXQwenImageEditTurboTests"
+        ),
+        .testTarget(
+            name: "MLXQwenImageFlashTests",
+            dependencies: [
+                "MLXQwenImageFlash",
+                // split-footprint mem-bench needs the core generator + MLX peak APIs directly.
+                "QwenImageEdit",
+                .product(name: "MLX", package: "mlx-swift"),
+                .product(name: "MLXServeConformance", package: "mlx-engine-swift"),
+            ],
+            path: "Tests/MLXQwenImageFlashTests"
         ),
     ]
 )

@@ -56,6 +56,20 @@ public enum QwenImagePipeline {
         return sigmas
     }
 
+    /// sigmas linspace(1, 1/steps, steps) with the STATIC time shift, trailing 0 — the
+    /// `use_dynamic_shifting: false` branch of FlowMatchEulerDiscreteScheduler.set_timesteps
+    /// (`sigma = shift*sigma / (1 + (shift-1)*sigma)`). Qwen-Image-Flash packages
+    /// `shift: 3.0` with dynamic shifting OFF, so `mu` / `calculateShift` are unused there:
+    /// 4 steps -> [1.0, 0.9, 0.75, 0.5, 0.0], the schedule the DMD2 student was distilled on.
+    public static func staticShiftedSigmas(steps: Int, shift: Float) -> [Float] {
+        let raw = (0..<steps).map { i -> Float in
+            1.0 - Float(i) * (1.0 - 1.0 / Float(steps)) / Float(max(steps - 1, 1))
+        }
+        var sigmas = raw.map { s in shift * s / (1 + (shift - 1) * s) }
+        sigmas.append(0)
+        return sigmas
+    }
+
     /// Norm-rescaled true CFG (reference L831-835).
     public static func guidedNoise(pos: MLXArray, neg: MLXArray, scale: Float) -> MLXArray {
         let comb = neg + scale * (pos - neg)

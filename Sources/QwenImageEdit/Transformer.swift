@@ -199,7 +199,52 @@ public final class QwenFeedForward: Module, UnaryLayer {
     }
 
     public func callAsFunction(_ x: MLXArray) -> MLXArray {
-        projOut(geluApproximate(projIn(x)))
+        Self.downProjected(projOut, geluApproximate(projIn(x)))
+    }
+
+    /// Row-chunked down-projection — the mlx#3797 workaround (fixed upstream by #3810).
+    ///
+    /// On mlx-swift ≤0.31.6 (`MLX_METAL_JIT=ON`) a half-precision matmul in the window
+    /// `M·N ≥ 2048² ∧ K ≥ 10240 ∧ K ≥ 3·max(M,N)` is mis-instantiated with the output dtype
+    /// and returns garbage on M5-class GPUs. This projection is K = 4·dim = 12288, N = 3072,
+    /// so the window is **1366 ≤ M ≤ 4096** image tokens. Measured on 0.31.6 (NAXProbeTests):
+    /// M=256 cos 0.99999887 · M=1366 cos 0.707 · M=2048 cos 0.0 · M=4096 **NaN**.
+    ///
+    /// The EDIT path never entered the window (target + conditioning tokens put M at 8192,
+    /// where `K ≥ 3·M` fails), which is why this only surfaced with the T2I path: 1024²
+    /// text-to-image is M = 4096 exactly, the upper edge.
+    ///
+    /// Chunking by rows is EXACT (each output row is independent) and far cheaper than
+    /// forcing fp32. Removal path: when the mlx-swift pin vendors #3810, run
+    /// `swift test --filter NAXProbeTests`; on PASS delete this and call `projOut` directly.
+    /// `QIE_NO_CHUNK=1` disables it for validation.
+    static let chunkRows = 896
+
+    /// The mlx#3797 trigger, evaluated on the ACTUAL shapes: chunk only inside the window so
+    /// the edit path (M = 8192, above it) keeps its existing single-GEMM kernel path.
+    static func inNAXWindow(rows: Int, k: Int, n: Int) -> Bool {
+        rows * n >= 2048 * 2048 && k >= 10240 && k >= 3 * max(rows, n)
+    }
+
+    static func downProjected(_ projOut: Linear, _ h: MLXArray) -> MLXArray {
+        let rows = h.ndim >= 2 ? h.dim(-2) : 0
+        let n = projOut.weight.dim(0)  // out features
+        let k = projOut.weight.dim(1)  // in features (= 4·dim)
+        guard rows > chunkRows, h.dtype != .float32,
+            Self.inNAXWindow(rows: rows, k: k, n: n),
+            ProcessInfo.processInfo.environment["QIE_NO_CHUNK"] != "1"
+        else {
+            return projOut(h)
+        }
+        var parts: [MLXArray] = []
+        parts.reserveCapacity((rows + chunkRows - 1) / chunkRows)
+        var start = 0
+        while start < rows {
+            let end = min(start + chunkRows, rows)
+            parts.append(projOut(h[.ellipsis, start..<end, 0...]))
+            start = end
+        }
+        return concatenated(parts, axis: -2)
     }
 }
 
@@ -352,6 +397,12 @@ public final class QwenTransformerBlock: Module {
 
     /// temb: (2B, dim) = [temb(t), temb(0)]. txt stream uses the real-t half only
     /// (reference L677-679); the img stream selects per token via modulateIndex.
+    ///
+    /// `modulateIndex == nil` = no conditioning tokens (the T2I path): every image token
+    /// takes the real-t params, which is the reference's `zero_cond_t=false` branch
+    /// (base `QwenImageTransformer2DModel`). The img mods must then come from the real-t
+    /// half alone — feeding the doubled temb through `modulate(index: nil)` would leave
+    /// 2B mod rows against B token rows.
     public func callAsFunction(
         hiddenStates: MLXArray,
         encoderHiddenStates: MLXArray,
@@ -364,7 +415,8 @@ public final class QwenTransformerBlock: Module {
         var encoderHiddenStates = encoderHiddenStates
         let b = temb.dim(0) / 2
 
-        let imgMods = split(imgMod(silu(temb)), parts: 2, axis: -1)
+        let imgTemb = modulateIndex == nil ? temb[..<b] : temb
+        let imgMods = split(imgMod(silu(imgTemb)), parts: 2, axis: -1)
         let txtMods = split(txtMod(silu(temb[..<b])), parts: 2, axis: -1)
 
         let (imgModulated, imgGate1) = Self.modulate(
