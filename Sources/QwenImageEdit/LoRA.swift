@@ -324,6 +324,12 @@ public final class QwenImageEditLoRASwapper {
         }
         try model.update(parameters: ModuleParameters.unflattened(params), verify: .noUnusedKeys)
         applied = targetKeys
+        // bf16 + runtime adapters trip a long-graph dispatch corruption on current mlx-swift
+        // (banded static above ~1366 image tokens); per-block graph chaining eliminates it at
+        // ~nil cost. Quantized bases (QLoRALinear path) are unaffected and keep the single
+        // graph. See QwenImageTransformer2DModel.chainBlockGraphs.
+        let quantizedBase = pristine.values.contains { $0 is QuantizedLinear }
+        model.chainBlockGraphs = !quantizedBase
     }
 
     /// Restore the pristine base in every currently-adapted target.
@@ -337,5 +343,6 @@ public final class QwenImageEditLoRASwapper {
             if !restore.isEmpty { block.update(modules: .unflattened(restore)) }
         }
         applied = []
+        model.chainBlockGraphs = false
     }
 }

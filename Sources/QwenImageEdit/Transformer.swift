@@ -466,6 +466,24 @@ public final class AdaLayerNormContinuous: Module {
 
 /// QwenImageTransformer2DModel (zero_cond_t=true, guidance_embeds=false).
 public final class QwenImageTransformer2DModel: Module {
+
+    /// Break the lazy graph after every transformer block.
+    ///
+    /// Production lever for the bf16 + runtime-LoRA corruption (AGENT_BRIDGE 2026-07-25):
+    /// with adapters attached at bf16, the step graph gains ~28 lazy nodes per block and
+    /// renders collapse into banded static above ~1366 image tokens on current mlx-swift —
+    /// the long-graph fused-dispatch family. Chaining the graph per block eliminates it
+    /// (verified: roughness 1.0+ static → 0.138 coherent at 1024²) at ~nil measured cost
+    /// (80.6 s vs the 83.3 s cold no-LoRA baseline). `QwenImageEditLoRASwapper` sets this
+    /// automatically when adapters are attached to an unquantized base; quantized bases are
+    /// unaffected by the bug and skip it.
+    public var chainBlockGraphs = false
+
+    /// Debug override (QIE_EVAL_PER_BLOCK=1): force per-block chaining regardless of the
+    /// swapper. Kept for bisecting future long-graph suspects.
+    static let debugEvalPerBlock =
+        ProcessInfo.processInfo.environment["QIE_EVAL_PER_BLOCK"] == "1"
+
     public let inChannels: Int
     public let outChannels: Int
     public let innerDim: Int
@@ -577,6 +595,7 @@ public final class QwenImageTransformer2DModel: Module {
                 hiddenStates: hidden, encoderHiddenStates: encoder, temb: temb,
                 imageRotaryEmb: imageRotaryEmb, attentionMask: attentionMask,
                 modulateIndex: modulateIndex)
+            if chainBlockGraphs || Self.debugEvalPerBlock { eval(encoder, hidden) }
         }
         if let stepCache {
             let shallow = hidden
@@ -591,6 +610,7 @@ public final class QwenImageTransformer2DModel: Module {
                         hiddenStates: hidden, encoderHiddenStates: encoder, temb: temb,
                         imageRotaryEmb: imageRotaryEmb, attentionMask: attentionMask,
                         modulateIndex: modulateIndex)
+                    if chainBlockGraphs || Self.debugEvalPerBlock { eval(encoder, hidden) }
                 }
                 stepCache.store(shallow: shallow, deep: hidden, sigma: sigma)
             }
