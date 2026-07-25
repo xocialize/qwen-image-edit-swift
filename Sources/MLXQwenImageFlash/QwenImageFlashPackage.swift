@@ -39,7 +39,12 @@ public struct QwenImageFlashConfiguration:
     /// quantization of the DiT is the tracked follow-up (bf16 parity gates first).
     public var quant: Quant { .bf16 }
 
-    public static let repo = "nvidia/Qwen-Image-Flash"
+    /// The published MLX snapshot, NOT the upstream repo. The weights there are byte-identical
+    /// to `nvidia/Qwen-Image-Flash` (verified by blob hash) — the reason to source from
+    /// mlx-community is `tokenizer/tokenizer.json`: upstream ships slow-tokenizer files only
+    /// (`vocab.json` + `merges.txt`), which swift-transformers cannot read, so a fresh machine
+    /// pointed at upstream materializes a snapshot this package cannot load.
+    public static let repo = "mlx-community/Qwen-Image-Flash-bf16"
 
     public init(
         snapshotPath: String? = nil,
@@ -138,8 +143,10 @@ public final class QwenImageFlashPackage: ModelPackage {
             // additionally carries Apache-2.0 as "Additional Information". C8: port code MIT.
             license: LicenseDeclaration(
                 weightLicense: .nvidiaOpenModel, portCodeLicense: .mit),
+            // Provenance points at the ORIGINAL model; `Configuration.repo` is where the
+            // materializer fetches from (the mlx-community mirror carrying tokenizer.json).
             provenance: Provenance(
-                sourceRepo: QwenImageFlashConfiguration.repo, revision: "main", tier: 1),
+                sourceRepo: "nvidia/Qwen-Image-Flash", revision: "main", tier: 1),
             requirements: RequirementsManifest(
                 // Split footprint (efficiency contract 1.14.0), MEASURED by this package's own
                 // mem-bench (FlashMemBenchTests, QIF_MEMBENCH=1) on M5 Max at the input

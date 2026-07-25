@@ -24,7 +24,7 @@ style transfer** (TeleStyleV2).
   (template drop_idx 34, not 64), no conditioning latents, and the packaged **static** shift-3
   schedule (`use_dynamic_shifting: false`) giving sigmas `[1.0, 0.9, 0.75, 0.5, 0.0]`.
   Guidance was internalized by the distillation, so it runs true CFG 1.0 — one DiT forward
-  per step. Weights: NVIDIA Open Model License (commercially permissive; redistributing the
+  per step. Weights: [`mlx-community/Qwen-Image-Flash-bf16`](https://huggingface.co/mlx-community/Qwen-Image-Flash-bf16) — NVIDIA Open Model License (commercially permissive; redistributing the
   weights requires shipping the Agreement + the "Licensed by NVIDIA Corporation under the
   NVIDIA Open Model License" notice) with Apache-2.0 as additional information.
 
