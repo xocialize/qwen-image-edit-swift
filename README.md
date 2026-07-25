@@ -67,7 +67,15 @@ is; this wrapper needs MLX weights and reads a local snapshot — it does not do
 local `Qwen-Image-Edit-2511` snapshot. The package
 depends on **`qwen25vl-mlx-swift`** (VL conditioning) and **`mlx-engine-swift`** (the `MLXToolKit`
 contract) via tagged-URL net dependencies (`.package(url: "https://github.com/xocialize/qwen25vl-mlx-swift", from: "0.1.0")`
-and `.package(url: "https://github.com/xocialize/mlx-engine-swift", from: "0.3.0")`), so it builds
-standalone. ~60 GB resident bf16 (20B DiT + VL-7B + fp32 VAE); 4-bit DiT+VL (~16 GB) is a tracked follow-up.
+and `.package(url: "https://github.com/xocialize/mlx-engine-swift", from: "0.32.0")` — the floor is
+0.32.0 for contract 1.24 `WeightSourcing` + the allowlisted `SPDXLicense.nvidiaOpenModel`, both used
+by `MLXQwenImageFlash`), so it builds standalone. ~60 GB resident bf16 (20B DiT + VL-7B + fp32 VAE);
+4-bit DiT+VL (~16 GB) is a tracked follow-up.
 
-Apache-2.0 (weights) · MIT (port code).
+`MLXQwenImageFlash` is the exception to the "no Hub weights" note above: it materializes from
+[`mlx-community/Qwen-Image-Flash-bf16`](https://huggingface.co/mlx-community/Qwen-Image-Flash-bf16)
+with no local snapshot required. Measured split footprint 41.4 GB resident / 19.3 GB activation
+(1024², 4 steps).
+
+MIT (port code) · weights per model: Apache-2.0 (Qwen-Image-Edit-2511, TeleStyleV2),
+NVIDIA Open Model License (Qwen-Image-Flash).
