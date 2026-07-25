@@ -170,11 +170,18 @@ public struct QwenImageFlashConfiguration:
 public enum QwenImageFlashPackageError: Error, LocalizedError {
     case unreadableSnapshot(String)
     case pngEncode
+    /// mlx#3797: bf16 + runtime adapters corrupt for image-token counts in [1366, 4096] on
+    /// the current mlx-swift pin. Use the int8 tier or a size outside the window.
+    case loraUnsupportedAtSize(width: Int, height: Int, tokens: Int)
 
     public var errorDescription: String? {
         switch self {
         case .unreadableSnapshot(let p): return "Qwen-Image-Flash snapshot not readable at \(p)."
         case .pngEncode: return "PNG encoding failed."
+        case .loraUnsupportedAtSize(let w, let h, let t):
+            return "LoRA at bf16 is unavailable for \(w)×\(h) (\(t) image tokens): a runtime "
+                + "kernel bug (mlx#3797) corrupts token counts 1366–4096. Use the int8 tier, "
+                + "or a size outside that range."
         }
     }
 }
@@ -350,7 +357,22 @@ public final class QwenImageFlashPackage: ModelPackage {
         // LoRA stack: apply before the denoise loop, skipping the swap when the selection is
         // unchanged (a re-roll with a new seed is the common case). Trigger words are the
         // caller's job — they belong in the prompt, which the package does not rewrite.
-        try await applyLoRAStack(LoRAStackItem.decode(t2i.metaData[FlashLoRAMetaKeys.stack]))
+        let stack = LoRAStackItem.decode(t2i.metaData[FlashLoRAMetaKeys.stack])
+        // mlx#3797 guard: on current mlx-swift, a bf16 base with runtime adapters attached
+        // dispatches a mis-instantiated JIT split-K kernel for image-token counts in
+        // [1366, 4096] — renders come out as static or NaN black. Confirmed by A/B against
+        // the #3810-patched runtime (clean) and by int8 (different kernels, clean at every
+        // size). Refuse loudly instead of rendering garbage; callers route LoRA requests to
+        // the int8 tier or an out-of-window size. Delete when the pin vendors mlx ≥ a8c3e9c
+        // (removal signal: NAXProbeTests + a bf16+LoRA render at 1360×768).
+        let imageTokens = (height / 16) * (width / 16)
+        if !stack.isEmpty, configuration.effectiveQuant == .bf16,
+            (1366...4096).contains(imageTokens)
+        {
+            throw QwenImageFlashPackageError.loraUnsupportedAtSize(
+                width: width, height: height, tokens: imageTokens)
+        }
+        try await applyLoRAStack(stack)
 
         let prof = MLXProfiler.shared
         prof.beginRun("qwen-image-flash textToImage steps=\(steps) \(width)x\(height)")

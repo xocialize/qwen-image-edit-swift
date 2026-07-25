@@ -100,6 +100,44 @@ final class NAXProbeTests: XCTestCase {
         }
     }
 
+    /// The 3-D BATCHED variant of the adapter shape: `x[1, M, 12288] @ loraA[12288, rank]`.
+    ///
+    /// The 2-D probe above is clean — but the runtime never issues 2-D: activations are
+    /// [B, M, K]. A batched huge-K / tiny-N matmul can dispatch to a DIFFERENT split-K
+    /// kernel (gemv-splitk family) than the 2-D gemm path, and mlx#3810 patched only the
+    /// gemm split-K NAX instantiation. Cheap, weights-free, and it covers the LoRA black-
+    /// render suspects at the exact runtime ranks/Ms.
+    func testLoRAAdapterGEMMShape3D() {
+        let k = 12288
+        for rank in [32] {
+            let b = Self.lcgArray([k, rank], seed: UInt64(rank)).asType(.bfloat16)
+            for m in [1024, 4032, 4080, 4096, 4128] {
+                let a = Self.lcgArray([1, m, k], seed: UInt64(m &* 13)).asType(.bfloat16)
+                let y = matmul(a, b)
+                let ref = matmul(a.asType(.float32), b.asType(.float32))
+                eval(y, ref)
+                let cos = Self.cosine(y, ref)
+                let maxAbs = abs(y.asType(.float32) - ref).max().item(Float.self)
+                print(String(
+                    format: "  lora-A-3D M=%d K=%d N=%d bf16: cos %.8f max_abs %.3e",
+                    m, k, rank, cos, maxAbs))
+                XCTAssertGreaterThan(cos, 0.999, "3D M=\(m): adapter GEMM corrupt")
+                XCTAssertTrue(maxAbs.isFinite, "3D M=\(m): non-finite")
+            }
+        }
+        // The second adapter GEMM, batched: [1, M, rank] @ [rank, N].
+        let b2 = Self.lcgArray([32, 3072], seed: 77).asType(.bfloat16)
+        for m in [4032, 4080, 4096] {
+            let a2 = Self.lcgArray([1, m, 32], seed: UInt64(m)).asType(.bfloat16)
+            let y = matmul(a2, b2)
+            let ref = matmul(a2.asType(.float32), b2.asType(.float32))
+            eval(y, ref)
+            let cos = Self.cosine(y, ref)
+            print(String(format: "  lora-B-3D M=%d K=32 N=3072 bf16: cos %.8f", m, cos))
+            XCTAssertGreaterThan(cos, 0.999)
+        }
+    }
+
     /// The invariant that keeps 1024² T2I renderable on the current pin: the row-chunked
     /// down-projection must match the fp32 reference at M = 4096, where the unchunked bf16
     /// GEMM returns NaN. Random weights — this tests the kernel path, not the model.

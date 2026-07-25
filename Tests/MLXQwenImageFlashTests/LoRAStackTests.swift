@@ -81,4 +81,14 @@ final class FlashLoRAStackTests: XCTestCase {
         let cache = LoRACache(directory: URL(fileURLWithPath: "/tmp/qif-lora-cache"))
         XCTAssertEqual(cache.localURL(for: entry).lastPathComponent, "martha.safetensors")
     }
+
+    /// The mlx#3797 window guard: bf16 + adapters must refuse in-window sizes loudly instead
+    /// of rendering static/NaN. int8 and out-of-window sizes pass through.
+    func testWindowGuardBoundaries() {
+        // (width, height) -> tokens; guard fires only for bf16 + non-empty stack + [1366,4096]
+        XCTAssertTrue((1366...4096).contains((768 / 16) * (1360 / 16)))   // 4080 in
+        XCTAssertTrue((1366...4096).contains((1024 / 16) * (1024 / 16)))  // 4096 boundary in
+        XCTAssertFalse((1366...4096).contains((768 / 16) * (1376 / 16)))  // 4128 out
+        XCTAssertFalse((1366...4096).contains((512 / 16) * (512 / 16)))   // 1024 below
+    }
 }

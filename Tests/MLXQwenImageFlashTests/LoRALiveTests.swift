@@ -113,6 +113,11 @@ final class FlashLoRALiveTests: XCTestCase {
         let swapper = QwenImageEditLoRASwapper(model: transformer)
         try swapper.set([(file, 1.0)])
         XCTAssertGreaterThan(swapper.activeKeys.count, 0, "\(name) bound nothing")
+        // Matrix lever: QIF_NO_CHAIN=1 disables the swapper-set per-block chaining, isolating
+        // whether a failure is the long-graph race (chaining-sensitive) or something else.
+        if ProcessInfo.processInfo.environment["QIF_NO_CHAIN"] == "1" {
+            transformer.chainBlockGraphs = false
+        }
 
         let snapshot = snapshotRoot
         let encPath = useBF16
@@ -129,10 +134,14 @@ final class FlashLoRALiveTests: XCTestCase {
         // QIF_LORA_SIZE bisects the mlx#3797 NAX window: at 512² the img FFN sees M=1024
         // (BELOW the 1366 threshold), at 1024² it sees M=4096 (the upper edge, in-window).
         let side = ProcessInfo.processInfo.environment["QIF_LORA_SIZE"].flatMap(Int.init) ?? 1024
+        // QIF_LORA_W/H override for non-square repros (the demo renders 1360x768 = M 4080,
+        // which manifested as BLACK/NaN in-app while square 1024^2 gave banded static).
+        let width = ProcessInfo.processInfo.environment["QIF_LORA_W"].flatMap(Int.init) ?? side
+        let height = ProcessInfo.processInfo.environment["QIF_LORA_H"].flatMap(Int.init) ?? side
         let start = Date()
         let (pixels, w, h) = try await generator.generate(
             prompt: "a lighthouse on a rocky coast at sunset",
-            width: side, height: side, steps: 4, trueCFGScale: 1.0, seed: 42,
+            width: width, height: height, steps: 4, trueCFGScale: 1.0, seed: 42,
             progress: { _, _ in })
         print(String(
             format: "[lora-render] %@ (%d keys) %dx%d in %.1f s",
@@ -140,7 +149,7 @@ final class FlashLoRALiveTests: XCTestCase {
 
         // The package's own PNG encoder — same path the engine returns to a consumer.
         let out = Self.goldens.appendingPathComponent(
-            "swift_t2i_lora_\(name)_\(useBF16 ? "bf16" : "int8")_\(side).png")
+            "swift_t2i_lora_\(name)_\(useBF16 ? "bf16" : "int8")_\(width)x\(height).png")
         try QwenImageFlashPackage.encodePNG(pixels: pixels, width: w, height: h).write(to: out)
         print("[saved] \(out.path)")
 
