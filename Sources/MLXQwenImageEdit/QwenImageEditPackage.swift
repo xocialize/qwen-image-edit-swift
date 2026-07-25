@@ -16,8 +16,11 @@ import QwenImageEdit
 import UniformTypeIdentifiers
 
 /// Init-time configuration (C9): the 2511 snapshot root and generation defaults.
-public struct QwenImageEditConfiguration: PackageConfiguration, ModelStorable, QuantConfigured {
-    /// Snapshot root with `transformer/`, `vae/`, `text_encoder/`, `processor/`.
+public struct QwenImageEditConfiguration:
+    PackageConfiguration, ModelStorable, QuantConfigured, WeightSourcing
+{
+    /// Explicit snapshot root with `transformer/`, `vae/`, `text_encoder/`, `processor/`.
+    /// Empty = resolve from the model store, materializing from `repo` on first run.
     public var snapshotPath: String
     public var defaultSteps: Int
     public var defaultTrueCFGScale: Float
@@ -32,9 +35,63 @@ public struct QwenImageEditConfiguration: PackageConfiguration, ModelStorable, Q
     /// charge the matching split `QuantFootprint` instead of the largest-that-fits guess.
     public var quant: Quant { .bf16 }
 
+    /// Upstream weights. Unlike the Flash tier there is no MLX mirror to publish: this port
+    /// reads the diffusers-layout safetensors directly (key sanitizing + conv transposes happen
+    /// at load), and upstream already ships `processor/tokenizer.json` — the file whose absence
+    /// forced a mirror for Flash. So the materializer points straight at Qwen.
+    public static let repo = "Qwen/Qwen-Image-Edit-2511"
+
+    /// Fresh-machine sources (MAT), split by role so a future quantized tier can swap the
+    /// transformer glob without touching the rest.
+    public var weightSources: [WeightSource] {
+        [
+            WeightSource(
+                role: "transformer", repo: Self.repo, revision: "main",
+                matching: ["transformer/*"]),
+            WeightSource(role: "vae", repo: Self.repo, revision: "main", matching: ["vae/*"]),
+            WeightSource(
+                role: "text-encoder", repo: Self.repo, revision: "main",
+                matching: ["text_encoder/*", "processor/*"]),
+            WeightSource(
+                role: "pipeline-config", repo: Self.repo, revision: "main",
+                matching: ["model_index.json", "scheduler/*"]),
+        ]
+    }
+
+    /// Honor an explicit snapshot path first (it satisfies everything), then the store layout.
+    public func missingWeightSources(storeRoot: URL?) -> [WeightSource] {
+        if !snapshotPath.isEmpty,
+            FileManager.default.fileExists(
+                atPath: URL(fileURLWithPath: snapshotPath)
+                    .appendingPathComponent("transformer").path)
+        {
+            return []
+        }
+        return defaultMissingWeightSources(storeRoot: storeRoot)
+    }
+
+    /// Store-resolved snapshot root (what `load()` uses after materialization): explicit path
+    /// wins, then the engine-executed flat layout, then a hub-client `snapshots/<commit>/`.
+    public func resolvedSnapshotDirectory(storeRoot: URL?) -> URL? {
+        if !snapshotPath.isEmpty { return URL(fileURLWithPath: snapshotPath) }
+        let store = ModelStore(root: storeRoot)
+        let fm = FileManager.default
+        if let flat = store.directory(for: Self.repo),
+            fm.fileExists(atPath: flat.appendingPathComponent("transformer").path)
+        {
+            return flat
+        }
+        if let snap = store.snapshotDirectory(for: Self.repo, revision: "main"),
+            fm.fileExists(atPath: snap.appendingPathComponent("transformer").path)
+        {
+            return snap
+        }
+        return store.directory(for: Self.repo)
+    }
+
     public init(
-        snapshotPath: String =
-            "/Volumes/DEV_VOL1/VideoResearch/qwen-image-edit-models/Qwen-Image-Edit-2511",
+        /// Empty (the default) routes through the model store; pass a path to pin a local snapshot.
+        snapshotPath: String = "",
         defaultSteps: Int = 20,
         defaultTrueCFGScale: Float = 4.0,
         stepCache: StepCacheMode? = nil,
@@ -117,10 +174,18 @@ public final class QwenImageEditPackage: ModelPackage {
 
     public func load() async throws {
         guard generator == nil else { return }
-        let snapshot = URL(fileURLWithPath: configuration.snapshotPath)
-        guard FileManager.default.fileExists(
-            atPath: snapshot.appendingPathComponent("transformer").path)
-        else { throw QwenImageEditPackageError.unreadableSnapshot(snapshot.path) }
+        // First-run materialization is engine-executed (contract 1.24): the declared
+        // WeightSourcing sources are fetched before load() runs. This guard is the offline
+        // backstop so absent weights still fail legibly.
+        guard let snapshot = configuration.resolvedSnapshotDirectory(
+            storeRoot: configuration.modelsRootDirectory),
+            FileManager.default.fileExists(
+                atPath: snapshot.appendingPathComponent("transformer").path)
+        else {
+            throw QwenImageEditPackageError.unreadableSnapshot(
+                configuration.snapshotPath.isEmpty
+                    ? QwenImageEditConfiguration.repo : configuration.snapshotPath)
+        }
 
         // DiT + VAE stay resident; the VL-7B encoder is loaded per request and evicted
         // before the denoise peak (efficiency contract 1.14.0 — see QwenImageEditGenerator).

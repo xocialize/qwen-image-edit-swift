@@ -236,7 +236,9 @@ public final class QwenImageFlashPackage: ModelPackage {
                         + "Qwen-Image, 20B MMDiT + Qwen2.5-VL conditioning): four deterministic "
                         + "steps on a static shift-3 FlowMatch Euler schedule with guidance "
                         + "internalized (true CFG 1.0), tested at 1024²; any size divisible "
-                        + "by 16.",
+                        + "by 16. Optional multi-LoRA stack per request (metaData `loras`: "
+                        + "[{id, repo, file, strength}]), hot-swapped on the resident DiT and "
+                        + "lazy-cached from HuggingFace.",
                     modes: []
                 )
             ]
@@ -245,6 +247,12 @@ public final class QwenImageFlashPackage: ModelPackage {
 
     private let configuration: Configuration
     private var generator: QwenImageT2IGenerator?
+    /// Community-LoRA stack: adapters rank-stack on the resident 20B DiT via the swapper,
+    /// so switching styles costs only the rank-r factors — never a base reload.
+    private var swapper: QwenImageEditLoRASwapper?
+    private var loraCache: LoRACache?
+    /// Last applied stack, so a re-roll (new seed, same styles) skips the swap entirely.
+    private var appliedStack: [LoRAStackItem] = []
 
     public nonisolated init(configuration: Configuration) {
         self.configuration = configuration
@@ -298,6 +306,17 @@ public final class QwenImageFlashPackage: ModelPackage {
                     snapshot: snapshot, quantizedTextModelPath: encoderQuantPath)
             },
             transformer: transformer, vae: vae, shift: shift)
+        // Community-LoRA seam. The swapper holds the base weights by reference, so a style
+        // change re-applies only the low-rank factors — the 20B DiT is never reloaded.
+        // Runtime `apply` (what the swapper does), never `fuse`: at bf16/int8 a fused delta
+        // rounds away below the ULP (see QwenImageEditLoRA's precision note).
+        self.swapper = QwenImageEditLoRASwapper(model: transformer)
+        let cacheRoot = configuration.modelsRootDirectory
+            ?? (try? FileManager.default.url(
+                for: .cachesDirectory, in: .userDomainMask, appropriateFor: nil, create: true))
+            ?? URL(fileURLWithPath: NSTemporaryDirectory())
+        self.loraCache = LoRACache(directory: cacheRoot.appendingPathComponent("qif-lora-cache"))
+        self.appliedStack = []
         // FR4: absorb the first-forward graph/kernel build at load, not on the first request.
         generator.warmup()
         self.generator = generator
@@ -305,6 +324,9 @@ public final class QwenImageFlashPackage: ModelPackage {
 
     public func unload() async {
         generator = nil
+        swapper = nil
+        loraCache = nil
+        appliedStack = []
         MLX.Memory.clearCache()  // release the retained pool so eviction actually frees RSS
     }
 
@@ -325,6 +347,11 @@ public final class QwenImageFlashPackage: ModelPackage {
         let steps = t2i.steps ?? configuration.defaultSteps
         let trueCFG = t2i.guidanceScale.map(Float.init) ?? configuration.defaultTrueCFGScale
 
+        // LoRA stack: apply before the denoise loop, skipping the swap when the selection is
+        // unchanged (a re-roll with a new seed is the common case). Trigger words are the
+        // caller's job — they belong in the prompt, which the package does not rewrite.
+        try await applyLoRAStack(LoRAStackItem.decode(t2i.metaData[FlashLoRAMetaKeys.stack]))
+
         let prof = MLXProfiler.shared
         prof.beginRun("qwen-image-flash textToImage steps=\(steps) \(width)x\(height)")
         let (pixels, w, h) = try await generator.generate(
@@ -340,6 +367,30 @@ public final class QwenImageFlashPackage: ModelPackage {
         try Task.checkCancellation()
         let png = try Self.encodePNG(pixels: pixels, width: w, height: h)
         return T2IResponse(image: Image(format: .png, data: png, width: w, height: h))
+    }
+
+    /// Rank-stack the requested adapters on the resident DiT.
+    ///
+    /// No-op when the selection is unchanged, so re-rolling a seed costs nothing. An empty
+    /// stack detaches back to the base weights. Downloads are lazy and cached per adapter id;
+    /// a `CancellationError` from the download propagates unchanged (CAN-2).
+    private func applyLoRAStack(_ stack: [LoRAStackItem]) async throws {
+        guard let swapper else { return }
+        guard stack != appliedStack else { return }
+        guard !stack.isEmpty else {
+            swapper.detach()
+            appliedStack = []
+            return
+        }
+        guard let loraCache else { return }
+        var resolved: [(url: URL, strength: Float)] = []
+        resolved.reserveCapacity(stack.count)
+        for item in stack {
+            resolved.append((try await loraCache.ensure(item.entry), item.strength))
+        }
+        try Task.checkCancellation()
+        try swapper.set(resolved)
+        appliedStack = stack
     }
 
     /// Static `shift` from the snapshot's packaged scheduler config (Flash: 3.0, dynamic off).
