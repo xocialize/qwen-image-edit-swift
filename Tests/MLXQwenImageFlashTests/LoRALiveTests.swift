@@ -95,18 +95,30 @@ final class FlashLoRALiveTests: XCTestCase {
         else { throw XCTSkip("no mirrored adapter to render with") }
         let name = file.deletingPathExtension().lastPathComponent
 
-        let transformer = try QwenImageEditWeights.loadQuantizedDiT(
-            from: Self.quantSnapshot.appendingPathComponent(
-                QwenImageFlashConfiguration.int8DiTFile))
+        // QIF_LORA_DTYPE=bf16 loads the UNQUANTIZED DiT — the tier the app actually runs at
+        // when the governor can seat bf16, and the one where the in-app LoRA render came out
+        // black while the int8 CLI render was fine.
+        let useBF16 = ProcessInfo.processInfo.environment["QIF_LORA_DTYPE"] == "bf16"
+        let bf16Snapshot = URL(
+            fileURLWithPath: "/Volumes/DEV_ARCHIVE/models/nvidia/Qwen-Image-Flash")
+        let snapshotRoot = useBF16 ? bf16Snapshot : Self.quantSnapshot
+        let transformer = useBF16
+            ? try QwenImageEditWeights.loadDiTFromPT(
+                directory: bf16Snapshot.appendingPathComponent("transformer"), dtype: .bfloat16)
+            : try QwenImageEditWeights.loadQuantizedDiT(
+                from: Self.quantSnapshot.appendingPathComponent(
+                    QwenImageFlashConfiguration.int8DiTFile))
         let vae = try QwenImageEditWeights.loadVAE(
-            directory: Self.quantSnapshot.appendingPathComponent("vae"), dtype: .float32)
+            directory: snapshotRoot.appendingPathComponent("vae"), dtype: .float32)
         let swapper = QwenImageEditLoRASwapper(model: transformer)
         try swapper.set([(file, 1.0)])
         XCTAssertGreaterThan(swapper.activeKeys.count, 0, "\(name) bound nothing")
 
-        let snapshot = Self.quantSnapshot
-        let encPath = snapshot.appendingPathComponent(
-            QwenImageFlashConfiguration.int8TextEncoderFile).path
+        let snapshot = snapshotRoot
+        let encPath = useBF16
+            ? nil
+            : snapshot.appendingPathComponent(
+                QwenImageFlashConfiguration.int8TextEncoderFile).path
         let generator = QwenImageT2IGenerator(
             encoderProvider: {
                 try await QwenVLPromptEncoder.loadTextOnly(
@@ -114,23 +126,50 @@ final class FlashLoRALiveTests: XCTestCase {
             },
             transformer: transformer, vae: vae, shift: 3.0)
 
+        // QIF_LORA_SIZE bisects the mlx#3797 NAX window: at 512² the img FFN sees M=1024
+        // (BELOW the 1366 threshold), at 1024² it sees M=4096 (the upper edge, in-window).
+        let side = ProcessInfo.processInfo.environment["QIF_LORA_SIZE"].flatMap(Int.init) ?? 1024
         let start = Date()
         let (pixels, w, h) = try await generator.generate(
             prompt: "a lighthouse on a rocky coast at sunset",
-            width: 1024, height: 1024, steps: 4, trueCFGScale: 1.0, seed: 42,
+            width: side, height: side, steps: 4, trueCFGScale: 1.0, seed: 42,
             progress: { _, _ in })
         print(String(
             format: "[lora-render] %@ (%d keys) %dx%d in %.1f s",
             name, swapper.activeKeys.count, w, h, -start.timeIntervalSinceNow))
 
         // The package's own PNG encoder — same path the engine returns to a consumer.
-        let out = Self.goldens.appendingPathComponent("swift_t2i_lora_\(name)_1024.png")
+        let out = Self.goldens.appendingPathComponent(
+            "swift_t2i_lora_\(name)_\(useBF16 ? "bf16" : "int8")_\(side).png")
         try QwenImageFlashPackage.encodePNG(pixels: pixels, width: w, height: h).write(to: out)
         print("[saved] \(out.path)")
 
-        let arr = MLXArray(pixels).asType(.float32)
-        let sd = sqrt(mean(square(arr - mean(arr))))
-        eval(sd)
-        XCTAssertGreaterThan(sd.item(Float.self), 10.0, "styled output looks degenerate")
+        assertLooksLikeAnImage(pixels, width: w, height: h, label: name)
+    }
+
+    /// Coherence check, not just a variance check.
+    ///
+    /// A plain `sd > 10` gate PASSES pure static — which is exactly how the first bf16+LoRA
+    /// corruption slipped through: NAX-corrupted output is high-variance noise, so variance
+    /// alone reads it as "not degenerate". Natural images are locally smooth, so the
+    /// discriminator is neighbour difference: adjacent pixels correlate strongly in a real
+    /// render and barely at all in noise.
+    func assertLooksLikeAnImage(
+        _ pixels: [UInt8], width: Int, height: Int, label: String,
+        file: StaticString = #filePath, line: UInt = #line
+    ) {
+        let a = MLXArray(pixels).reshaped([height, width, 3]).asType(.float32)
+        let sd = sqrt(mean(square(a - mean(a)))).item(Float.self)
+        // Mean |horizontal neighbour difference|, normalized by the image's own contrast.
+        let dx = abs(a[0..., 1...,  0...] - a[0..., ..<(width - 1), 0...])
+        let roughness = (mean(dx).item(Float.self)) / max(sd, 1e-6)
+
+        print(String(format: "[coherence] %@: sd %.1f  roughness %.3f", label, sd, roughness))
+        XCTAssertGreaterThan(sd, 10.0, "\(label): flat/degenerate output", file: file, line: line)
+        // Measured: coherent Flash renders sit near 0.1–0.3; NAX-corrupted static is ~1.0+.
+        XCTAssertLessThan(
+            roughness, 0.6,
+            "\(label): output is high-frequency noise, not an image (NAX corruption signature)",
+            file: file, line: line)
     }
 }

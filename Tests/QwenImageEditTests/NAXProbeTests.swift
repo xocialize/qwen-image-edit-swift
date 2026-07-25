@@ -72,6 +72,34 @@ final class NAXProbeTests: XCTestCase {
         }
     }
 
+    /// The LoRA down-projection adapter shape: `x[M, 12288] @ loraA[12288, rank]`.
+    ///
+    /// This is the shape a rank-32 adapter on `img_mlp.proj_out` introduces, and it is the
+    /// classic split-K candidate — enormous K, tiny N — which is exactly the family mlx#3797
+    /// mis-instantiates. It is NOT covered by `QwenFeedForward.downProjected`'s row-chunk,
+    /// because that chunks the BASE projection; this matmul lives inside the adapter.
+    /// Symptom when it corrupts: a LoRA render is clean below ~1366 image tokens (512²) and
+    /// becomes banded static at 1024², while the same LoRA at int8 is fine.
+    func testLoRAAdapterGEMMShape() throws {
+        let k = 12288
+        for rank in [16, 32, 64] {
+            let b = Self.lcgArray([k, rank], seed: UInt64(rank)).asType(.bfloat16)
+            for m in [1024, 2048, 4096] {
+                let a = Self.lcgArray([m, k], seed: UInt64(m &* 7)).asType(.bfloat16)
+                let y = matmul(a, b)
+                let ref = matmul(a.asType(.float32), b.asType(.float32))
+                eval(y, ref)
+                let cos = Self.cosine(y, ref)
+                let maxAbs = abs(y.asType(.float32) - ref).max().item(Float.self)
+                print(String(
+                    format: "  lora-A M=%d K=%d N=%d bf16: cos %.8f max_abs %.3e",
+                    m, k, rank, cos, maxAbs))
+                XCTAssertGreaterThan(cos, 0.999, "M=\(m) rank=\(rank): adapter GEMM corrupt")
+                XCTAssertTrue(maxAbs.isFinite, "M=\(m) rank=\(rank): non-finite")
+            }
+        }
+    }
+
     /// The invariant that keeps 1024² T2I renderable on the current pin: the row-chunked
     /// down-projection must match the fp32 reference at M = 4096, where the unchunked bf16
     /// GEMM returns NaN. Random weights — this tests the kernel path, not the model.
