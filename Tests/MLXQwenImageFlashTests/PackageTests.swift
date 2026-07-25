@@ -29,6 +29,12 @@ final class FlashPackageTests: XCTestCase {
         let bf16 = m.requirements.footprints.first { $0.quant == .bf16 }
         XCTAssertNotNil(bf16)
         XCTAssertGreaterThan(bf16?.peakActivationBytes ?? 0, 0)
+        // Both tiers are declared, and the quantized one must actually be smaller — the whole
+        // reason it exists is device reach.
+        let int8 = m.requirements.footprints.first { $0.quant == .int8 }
+        XCTAssertNotNil(int8)
+        XCTAssertLessThan(int8!.residentBytes, bf16!.residentBytes)
+        XCTAssertLessThan(int8!.peakActivationBytes, bf16!.peakActivationBytes)
     }
 
     /// The defaults ARE the contract for a distilled model: 4 steps on the packaged shift-3
@@ -54,6 +60,27 @@ final class FlashPackageTests: XCTestCase {
             satisfiedConfiguration: FileManager.default.fileExists(atPath: Self.snapshot)
                 ? satisfied : nil)
         XCTAssertTrue(report.passed, report.summary)
+    }
+
+    /// BudgetAware: a governor budget that cannot seat bf16 must degrade the tier BEFORE
+    /// materialization, so the machine downloads int8 rather than 41 GB of unusable bf16.
+    func testBudgetDegradesTierAndSources() {
+        let roomy = QwenImageFlashConfiguration(availableBudgetBytes: 100_000_000_000)
+        XCTAssertEqual(roomy.effectiveQuant, .bf16)
+        XCTAssertEqual(roomy.effectiveRepo, QwenImageFlashConfiguration.bf16Repo)
+
+        // 48 GB machine: bf16 needs ~61 GB and cannot be seated.
+        let tight = QwenImageFlashConfiguration(availableBudgetBytes: 48_000_000_000)
+        XCTAssertEqual(tight.effectiveQuant, .int8)
+        XCTAssertEqual(tight.effectiveRepo, QwenImageFlashConfiguration.int8Repo)
+        let globs = tight.weightSources.flatMap { $0.matching ?? [] }
+        XCTAssertTrue(globs.contains(QwenImageFlashConfiguration.int8DiTFile))
+        XCTAssertFalse(
+            globs.contains("transformer/*"),
+            "the int8 tier must not pull the 41 GB bf16 transformer it will never load")
+
+        // No budget information (direct/CLI use) keeps the quality tier.
+        XCTAssertEqual(QwenImageFlashConfiguration().effectiveQuant, .bf16)
     }
 
     func testWeightSourcesCoverTheWholePipeline() {

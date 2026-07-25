@@ -22,7 +22,7 @@ import UniformTypeIdentifiers
 
 /// Init-time configuration (C9): where the snapshot lives + generation defaults.
 public struct QwenImageFlashConfiguration:
-    PackageConfiguration, ModelStorable, QuantConfigured, WeightSourcing
+    PackageConfiguration, ModelStorable, QuantConfigured, BudgetAware, WeightSourcing
 {
     /// Explicit snapshot root (`transformer/`, `vae/`, `text_encoder/`, `tokenizer/`).
     /// `nil` = resolve from the model store, materializing on first run.
@@ -35,26 +35,71 @@ public struct QwenImageFlashConfiguration:
     public var defaultHeight: Int
     public var modelsRootDirectory: URL?
 
-    /// Always bf16 for now — the only tier with a measured footprint. Load-time int8/int4
-    /// quantization of the DiT is the tracked follow-up (bf16 parity gates first).
-    public var quant: Quant { .bf16 }
+    /// Requested precision tier. `.bf16` is the quality reference; `.int8` is the device-reach
+    /// tier (int8 attn+FFN+modulation DiT, int8 VL-7B text model, full-precision VAE). Both are
+    /// PRE-quantized artifacts — see `effectiveQuant` for why this is not a load-time choice.
+    ///
+    /// int4 was built and REJECTED on measurement, not on principle: DiT step-0 cosine 0.9623
+    /// at group 64 and 0.9659 at group 32 (vs 0.99836 bf16 / 0.9973 int8), and the 1024² render
+    /// came out visibly soft and washed out with fine fur/snow detail gone. Finer scales did not
+    /// rescue it — this DiT is intrinsically lossy at 4 bits. The recipe and its numbers live in
+    /// FlashQuantSweepTests so the decision is reproducible rather than folklore.
+    public var quant: Quant
 
-    /// The published MLX snapshot, NOT the upstream repo. The weights there are byte-identical
-    /// to `nvidia/Qwen-Image-Flash` (verified by blob hash) — the reason to source from
+    /// Set by the engine's memory governor before `resident()`/`prepare()` (BudgetAware).
+    public var availableBudgetBytes: UInt64?
+
+    /// The tier actually loaded. A declared `.bf16` degrades to `.int8` when the governor's
+    /// budget cannot seat the bf16 tier, which is the whole point of publishing both: bf16
+    /// needs ~61 GB (41.4 floor + 19.3 activation) and simply does not fit most Macs.
+    ///
+    /// This is resolved BEFORE materialization, not at load: `weightSources` keys off it too,
+    /// so a budget-constrained machine downloads the int8 snapshot rather than fetching 41 GB
+    /// of bf16 it can never seat.
+    public var effectiveQuant: Quant {
+        if quant != .bf16 { return quant }
+        guard let budget = availableBudgetBytes else { return .bf16 }
+        return budget >= Self.bf16TotalBytes ? .bf16 : .int8
+    }
+
+    /// bf16 resident floor + activation, from the measured split footprint.
+    static let bf16TotalBytes: UInt64 = 41_400_000_000 + 19_300_000_000
+
+    /// The published MLX snapshots, NOT the upstream repo. The weights are byte-identical to
+    /// `nvidia/Qwen-Image-Flash` (verified by blob hash) — the reason to source from
     /// mlx-community is `tokenizer/tokenizer.json`: upstream ships slow-tokenizer files only
     /// (`vocab.json` + `merges.txt`), which swift-transformers cannot read, so a fresh machine
     /// pointed at upstream materializes a snapshot this package cannot load.
-    public static let repo = "mlx-community/Qwen-Image-Flash-bf16"
+    public static let bf16Repo = "mlx-community/Qwen-Image-Flash-bf16"
+    /// Pre-quantized tier: int8 DiT + int8 VL-7B text model, converted once at the bf16 peak.
+    /// Consumers never pay a bf16 peak — which is what makes this tier reachable on machines
+    /// that cannot hold the bf16 weights at all.
+    public static let int8Repo = "mlx-community/Qwen-Image-Flash-8bit"
+
+    /// Back-compat alias for the default (bf16) repo.
+    public static let repo = bf16Repo
+
+    public var effectiveRepo: String {
+        effectiveQuant == .int8 ? Self.int8Repo : Self.bf16Repo
+    }
+
+    /// Pre-quantized file names inside an int8 snapshot.
+    public static let int8DiTFile = "transformer/model-int8.safetensors"
+    public static let int8TextEncoderFile = "text_encoder/model-int8.safetensors"
 
     public init(
         snapshotPath: String? = nil,
+        quant: Quant = .bf16,
         defaultSteps: Int = 4,
         defaultTrueCFGScale: Float = 1.0,
         defaultWidth: Int = 1024,
         defaultHeight: Int = 1024,
+        availableBudgetBytes: UInt64? = nil,
         modelsRootDirectory: URL? = nil
     ) {
         self.snapshotPath = snapshotPath
+        self.quant = quant
+        self.availableBudgetBytes = availableBudgetBytes
         self.defaultSteps = defaultSteps
         self.defaultTrueCFGScale = defaultTrueCFGScale
         self.defaultWidth = defaultWidth
@@ -62,22 +107,26 @@ public struct QwenImageFlashConfiguration:
         self.modelsRootDirectory = modelsRootDirectory
     }
 
-    /// Fresh-machine sources (MAT). Split by role so a future quantized tier can drop the
-    /// 41 GB bf16 transformer without touching the rest. All four live in the upstream repo:
-    /// the Swift loader consumes the diffusers-layout safetensors directly (key sanitizing and
-    /// the conv-layout transposes happen at load), so there is no separate converted artifact
-    /// to host for bf16.
+    /// Fresh-machine sources (MAT), split by role and keyed off `effectiveQuant` so the tier
+    /// that will be LOADED is the tier that gets downloaded.
     public var weightSources: [WeightSource] {
-        [
+        let repo = effectiveRepo
+        // Quant-aware globs: the int8 tier must NOT pull the 41 GB bf16 transformer it will
+        // never load (that download is the thing making the tier pointless on a small machine).
+        let transformer = effectiveQuant == .int8
+            ? [Self.int8DiTFile, "transformer/config.json"]
+            : ["transformer/*"]
+        let textEncoder = effectiveQuant == .int8
+            ? [Self.int8TextEncoderFile, "text_encoder/config.json", "tokenizer/*"]
+            : ["text_encoder/*", "tokenizer/*"]
+        return [
             WeightSource(
-                role: "transformer", repo: Self.repo, revision: "main",
-                matching: ["transformer/*"]),
-            WeightSource(role: "vae", repo: Self.repo, revision: "main", matching: ["vae/*"]),
+                role: "transformer", repo: repo, revision: "main", matching: transformer),
+            WeightSource(role: "vae", repo: repo, revision: "main", matching: ["vae/*"]),
             WeightSource(
-                role: "text-encoder", repo: Self.repo, revision: "main",
-                matching: ["text_encoder/*", "tokenizer/*"]),
+                role: "text-encoder", repo: repo, revision: "main", matching: textEncoder),
             WeightSource(
-                role: "pipeline-config", repo: Self.repo, revision: "main",
+                role: "pipeline-config", repo: repo, revision: "main",
                 matching: ["model_index.json", "scheduler/*"]),
         ]
     }
@@ -100,21 +149,21 @@ public struct QwenImageFlashConfiguration:
         if let snapshotPath { return URL(fileURLWithPath: snapshotPath) }
         let store = ModelStore(root: storeRoot)
         let fm = FileManager.default
-        if let flat = store.directory(for: Self.repo),
+        if let flat = store.directory(for: effectiveRepo),
             fm.fileExists(atPath: flat.appendingPathComponent("transformer").path)
         {
             return flat
         }
-        if let snap = store.snapshotDirectory(for: Self.repo, revision: "main"),
+        if let snap = store.snapshotDirectory(for: effectiveRepo, revision: "main"),
             fm.fileExists(atPath: snap.appendingPathComponent("transformer").path)
         {
             return snap
         }
-        return store.directory(for: Self.repo)
+        return store.directory(for: effectiveRepo)
     }
 
     private enum CodingKeys: String, CodingKey {
-        case snapshotPath, defaultSteps, defaultTrueCFGScale, defaultWidth, defaultHeight
+        case snapshotPath, quant, defaultSteps, defaultTrueCFGScale, defaultWidth, defaultHeight
     }
 }
 
@@ -161,10 +210,19 @@ public final class QwenImageFlashPackage: ModelPackage {
                 // it has no conditioning tokens — the DiT sequence is the target grid alone.
                 // [Smoke MLX-peak, not in-app phys_footprint; re-baseline once registered in
                 //  the image app (the BiRefNet ~2.7× lesson).]
+                //
+                // int8 (FlashQuantGateTests, same envelope): floor 22.3 GB, peak 30.0 GB,
+                // activation 7.8 GB → 9.3 GB at +20%. Near-lossless (DiT step-0 cos 0.9973 vs
+                // bf16's 0.99836; encoder 0.99992) and 4× faster end-to-end — 19.8 s vs 83.3 s
+                // at 1024²/4 steps, with a 2.3 s load instead of ~60 s. This is the tier that
+                // makes the model reachable below a 128 GB machine.
                 footprints: [
                     QuantFootprint(
                         quant: .bf16, residentBytes: 41_400_000_000,
-                        peakActivationBytes: 19_300_000_000)
+                        peakActivationBytes: 19_300_000_000),
+                    QuantFootprint(
+                        quant: .int8, residentBytes: 22_300_000_000,
+                        peakActivationBytes: 9_300_000_000),
                 ],
                 requiredBackends: [.metalGPU],
                 os: OSRequirement(minMacOS: SemanticVersion(major: 26, minor: 0, patch: 0)),
@@ -210,13 +268,35 @@ public final class QwenImageFlashPackage: ModelPackage {
         // DiT + VAE stay resident; the VL-7B encoder loads per request and is evicted before
         // the denoise peak. Text-only load: the ViT is never built (T2I conditions on text
         // alone), which also means a T2I snapshot needs no `processor/`.
-        let transformer = try QwenImageEditWeights.loadDiTFromPT(
-            directory: snapshot.appendingPathComponent("transformer"), dtype: .bfloat16)
+        //
+        // int8 loads PRE-quantized artifacts — never bf16-then-quantize. The bf16 peak exists
+        // only in the one-time conversion (FlashQuantConvertTests), so this tier is loadable
+        // on machines that could not hold the bf16 weights at all.
+        let transformer: QwenImageTransformer2DModel
+        let encoderQuantPath: String?
+        if configuration.effectiveQuant == .int8 {
+            let ditURL = snapshot.appendingPathComponent(Configuration.int8DiTFile)
+            let encURL = snapshot.appendingPathComponent(Configuration.int8TextEncoderFile)
+            guard FileManager.default.fileExists(atPath: ditURL.path),
+                FileManager.default.fileExists(atPath: encURL.path)
+            else { throw QwenImageFlashPackageError.unreadableSnapshot(ditURL.path) }
+            transformer = try QwenImageEditWeights.loadQuantizedDiT(from: ditURL)
+            encoderQuantPath = encURL.path
+        } else {
+            transformer = try QwenImageEditWeights.loadDiTFromPT(
+                directory: snapshot.appendingPathComponent("transformer"), dtype: .bfloat16)
+            encoderQuantPath = nil
+        }
+        // VAE stays full precision at every tier: 0.25 GB on disk, and decode is where
+        // precision loss shows up as visible colour/banding artifacts.
         let vae = try QwenImageEditWeights.loadVAE(
             directory: snapshot.appendingPathComponent("vae"), dtype: .float32)
         let shift = Self.readSchedulerShift(snapshot: snapshot)
         let generator = QwenImageT2IGenerator(
-            encoderProvider: { try await QwenVLPromptEncoder.loadTextOnly(snapshot: snapshot) },
+            encoderProvider: {
+                try await QwenVLPromptEncoder.loadTextOnly(
+                    snapshot: snapshot, quantizedTextModelPath: encoderQuantPath)
+            },
             transformer: transformer, vae: vae, shift: shift)
         // FR4: absorb the first-forward graph/kernel build at load, not on the first request.
         generator.warmup()

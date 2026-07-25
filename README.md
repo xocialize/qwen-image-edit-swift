@@ -24,9 +24,18 @@ style transfer** (TeleStyleV2).
   (template drop_idx 34, not 64), no conditioning latents, and the packaged **static** shift-3
   schedule (`use_dynamic_shifting: false`) giving sigmas `[1.0, 0.9, 0.75, 0.5, 0.0]`.
   Guidance was internalized by the distillation, so it runs true CFG 1.0 — one DiT forward
-  per step. Weights: [`mlx-community/Qwen-Image-Flash-bf16`](https://huggingface.co/mlx-community/Qwen-Image-Flash-bf16) — NVIDIA Open Model License (commercially permissive; redistributing the
-  weights requires shipping the Agreement + the "Licensed by NVIDIA Corporation under the
-  NVIDIA Open Model License" notice) with Apache-2.0 as additional information.
+  per step. Two tiers, both pre-quantized so consumers never materialize bf16:
+  [`-bf16`](https://huggingface.co/mlx-community/Qwen-Image-Flash-bf16) (quality reference,
+  41.4 GB resident / 57.4 GB peak, 83.3 s) and
+  [`-8bit`](https://huggingface.co/mlx-community/Qwen-Image-Flash-8bit) (near-lossless —
+  DiT cos 0.9973, encoder 0.99992 — 22.3 GB resident / 30.0 GB peak, **19.8 s**). The package
+  is `BudgetAware`: when the governor cannot seat bf16 it selects int8 *before* materializing,
+  so a constrained machine downloads 28 GB rather than 41 GB it could never load. No 4-bit
+  tier — int4 measured DiT cos 0.9623 (0.9659 at group 32) and rendered visibly soft/washed
+  out; the sweep is preserved in `FlashQuantSweepTests`. Weights: NVIDIA Open Model License
+  (commercially permissive; redistributing them requires shipping the Agreement + the
+  "Licensed by NVIDIA Corporation under the NVIDIA Open Model License" notice) with
+  Apache-2.0 as additional information.
 
 - **`MLXTeleStyle`** — [TeleStyleV2](https://github.com/Tele-AI/TeleStyleV2) content-preserving
   **style transfer** (`TeleStylePackage`, PackageID `telestyle-v2`): the `imageEdit` surface with a
@@ -72,10 +81,10 @@ and `.package(url: "https://github.com/xocialize/mlx-engine-swift", from: "0.32.
 by `MLXQwenImageFlash`), so it builds standalone. ~60 GB resident bf16 (20B DiT + VL-7B + fp32 VAE);
 4-bit DiT+VL (~16 GB) is a tracked follow-up.
 
-`MLXQwenImageFlash` is the exception to the "no Hub weights" note above: it materializes from
-[`mlx-community/Qwen-Image-Flash-bf16`](https://huggingface.co/mlx-community/Qwen-Image-Flash-bf16)
-with no local snapshot required. Measured split footprint 41.4 GB resident / 19.3 GB activation
-(1024², 4 steps).
+`MLXQwenImageFlash` is the exception to the "no Hub weights" note above: it materializes from the
+[Qwen-Image-Flash (MLX) collection](https://huggingface.co/collections/mlx-community/qwen-image-flash-mlx-6a64df3b105c561b3a939a0d)
+with no local snapshot required. Measured split footprints (1024², 4 steps): bf16 41.4 GB resident /
+19.3 GB activation; int8 22.3 / 9.3 GB.
 
 MIT (port code) · weights per model: Apache-2.0 (Qwen-Image-Edit-2511, TeleStyleV2),
 NVIDIA Open Model License (Qwen-Image-Flash).
