@@ -136,6 +136,9 @@ public final class WanAttentionBlock: Module {
 
 /// Upsampler: nearest-2x then Conv2d (checkpoint key `resample.1`). upsample3d
 /// variants also checkpoint a `time_conv`, which is unused for single-frame decode.
+/// The conv is a `WinogradFreeConv2d`: 384→192 and 192→96 are inside mlx's lossy Winograd
+/// conv2d window. fp32 decode vs the CPU lane: 2.0e-3 → 7.6e-6 (256² golden), 2.2e-3 → 9.6e-5
+/// (1024² photo; the rest is TF32 attention), for +12 ms on a ~1.1 s 1024² decode.
 public final class WanUpsample: Module {
     @ModuleInfo(key: "resample") var resample: [Conv2d]
     @ModuleInfo(key: "time_conv") var timeConv: QwenCausalConv3d?
@@ -144,7 +147,8 @@ public final class WanUpsample: Module {
         // upstream: resample = Sequential(Upsample(2x nearest), Conv2d) — index 1.
         // Our array has one Linear-position; sanitize maps `resample.1.` -> `resample.0.`.
         self._resample.wrappedValue = [
-            Conv2d(inputChannels: dim, outputChannels: dim / 2, kernelSize: 3, padding: 1)
+            WinogradFreeConv2d(
+                inputChannels: dim, outputChannels: dim / 2, kernelSize: 3, padding: 1)
         ]
         self._timeConv.wrappedValue = mode == "upsample3d"
             ? QwenCausalConv3d(
@@ -255,6 +259,15 @@ public final class QwenImageVAE: Module {
     /// input to this so a bf16 VAE runs the whole 1024² decode in bf16 (half the
     /// intermediates); defaults to fp32, the parity-locked regime.
     public var weightDtype: DType = .float32
+
+    /// Whether the decoder's upsampler convs take the exact conv3d route (default) instead of
+    /// mlx's lossy Winograd conv2d. `false` is for A/B validation only (WinogradFreeConv2d.swift).
+    public var winogradFreeConvs: Bool {
+        get { modules().allSatisfy { ($0 as? WinogradFreeConv2d)?.enabled ?? true } }
+        set {
+            for case let conv as WinogradFreeConv2d in modules() { conv.enabled = newValue }
+        }
+    }
 
     /// From vae/config.json (latents_mean / latents_std).
     public static let latentsMean: [Float] = [

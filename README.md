@@ -49,6 +49,41 @@ Validated against PyTorch fp32 goldens: DiT step-0 pos 0.99986 / neg 0.99944 bf1
 fp32-CPU) · VAE decode 73.7 dB · VAE encode 0.9999999 · VL encoder 0.974 bf16 / 0.9977 fp32-CPU.
 In-app eye-verified: a lighthouse photo edited "dusk + stormy → day + clear", identity-preserving.
 
+### GPU numerics: VAE upsampler convs (2026-09-24)
+
+mlx's Metal `conv2d` takes a Winograd F(6×6,3×3) path when the conv is 3×3, stride 1, dilation 1,
+groups 1, C % 32 == 0, O % 32 == 0, C + O ≥ 256 and N·H·W ≥ 4096. On M5 that path loses precision:
+about 6.4e-3 relL2 per conv in fp32, because its inner GEMM runs TF32 (`MLX_ENABLE_TF32` defaults
+on), and about 5.8e-2 in bf16. The decoder's three upsampler `resample` convs (384→192, 384→192,
+192→96) fall inside that window. They now run through `WinogradFreeConv2d`, which routes exactly
+those shapes through `conv3d` with kT = 1 (same math, implicit-GEMM path).
+
+Measurements, on the M5 Max with mlx-swift 0.31.6:
+
+| Decode, compared against | Raw conv2d (Winograd) | conv3d route |
+|---|---|---|
+| Flash 256² golden (diffusers fp32 CPU, clamped), GPU fp32 | 1.98e-3 · 64.6 dB | **7.6e-6 · 112.9 dB** |
+| 1024² DIV2K photo vs CPU-lane fp32, GPU fp32 | 2.20e-3 · 65.3 dB · max 6.3e-2 | **9.6e-5 · 92.5 dB** · max 4.0e-3 |
+| Same photo, GPU bf16 (`lowPrecisionVAE`) | 1.38e-2 · 49.4 dB · max 0.34 | 8.3e-3 · 53.7 dB · max 0.21 |
+| 1024² decode time, fp32 / bf16 (3 interleaved rounds) | ~1.10 s / ~1.04 s | +12 ms / ±0 |
+
+- The CPU lane reproduces the golden to 9.0e-7.
+- The 9.6e-5 that remains on the GPU is TF32 in the mid-block attention. With `MLX_ENABLE_TF32=0`,
+  both decode paths measure ~2e-6 against the CPU lane.
+- The encoder has no convs in the window (stride 2 plus conv3d). Its GPU-vs-CPU difference, 6.5e-5,
+  is the same attention TF32 effect.
+
+Tests:
+
+- `swift test --filter WinogradProbeTests` is weight-free. It is the removal signal: when a new
+  mlx-swift pin reports raw conv2d as exact, go back to plain `Conv2d`.
+- `QIE_PARITY=1 swift test -c release -Xswiftc -enable-testing --filter VAEGPULaneTests` compares
+  both lanes on real weights.
+
+For A/B validation, set `QIE_VAE_WINOGRAD=1` or `vae.winogradFreeConvs = false` to restore raw
+conv2d. The golden path in `VAEDecodeParityTests` (DEV_VOL1) no longer exists, so `VAEGPULaneTests`
+uses the Flash golden instead; the VAE weights are byte-identical.
+
 ## Use
 
 ```swift
