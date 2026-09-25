@@ -56,7 +56,8 @@ groups 1, C % 32 == 0, O % 32 == 0, C + O ≥ 256 and N·H·W ≥ 4096. On M5 th
 about 6.4e-3 relL2 per conv in fp32, because its inner GEMM runs TF32 (`MLX_ENABLE_TF32` defaults
 on), and about 5.8e-2 in bf16. The decoder's three upsampler `resample` convs (384→192, 384→192,
 192→96) fall inside that window. They now run through `WinogradFreeConv2d`, which routes exactly
-those shapes through `conv3d` with kT = 1 (same math, implicit-GEMM path).
+those shapes through `conv3d` with kT = 1 (same math, implicit-GEMM path). The route is the default
+for fp32 and bf16 (`vae.convRoute`, type `QwenVAEConvRoute`).
 
 Measurements, on the M5 Max with mlx-swift 0.31.6:
 
@@ -65,7 +66,8 @@ Measurements, on the M5 Max with mlx-swift 0.31.6:
 | Flash 256² golden (diffusers fp32 CPU, clamped), GPU fp32 | 1.98e-3 · 64.6 dB | **7.6e-6 · 112.9 dB** |
 | 1024² DIV2K photo vs CPU-lane fp32, GPU fp32 | 2.20e-3 · 65.3 dB · max 6.3e-2 | **9.6e-5 · 92.5 dB** · max 4.0e-3 |
 | Same photo, GPU bf16 (`lowPrecisionVAE`) | 1.38e-2 · 49.4 dB · max 0.34 | 8.3e-3 · 53.7 dB · max 0.21 |
-| 1024² decode time, fp32 / bf16 (3 interleaved rounds) | ~1.10 s / ~1.04 s | +12 ms / ±0 |
+| Same photo, GPU bf16, `.fp32Winograd` (bf16 upcast for the three convs) | — | 8.3e-3 · 53.8 dB · max 0.16 |
+| 1024² decode time, fp32 / bf16 (isolated, 3 interleaved rounds) | ~1.1 s / ~1.0 s | +12…74 ms / ±0…70 ms across runs (≤5%) |
 
 - The CPU lane reproduces the golden to 9.0e-7.
 - The 9.6e-5 that remains on the GPU is TF32 in the mid-block attention. With `MLX_ENABLE_TF32=0`,
@@ -80,8 +82,8 @@ Tests:
 - `QIE_PARITY=1 swift test -c release -Xswiftc -enable-testing --filter VAEGPULaneTests` compares
   both lanes on real weights.
 
-For A/B validation, set `QIE_VAE_WINOGRAD=1` or `vae.winogradFreeConvs = false` to restore raw
-conv2d. The golden path in `VAEDecodeParityTests` (DEV_VOL1) no longer exists, so `VAEGPULaneTests`
+For A/B validation, set `QIE_VAE_CONV_ROUTE=winograd` or `vae.convRoute = .winograd` to restore
+raw conv2d. The golden path in `VAEDecodeParityTests` (DEV_VOL1) no longer exists, so `VAEGPULaneTests`
 uses the Flash golden instead; the VAE weights are byte-identical.
 
 ## Use

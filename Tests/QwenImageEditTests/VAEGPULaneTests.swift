@@ -56,12 +56,13 @@ final class VAEGPULaneTests: XCTestCase {
         }
     }
 
-    /// GPU decode with the route on/off; warm-up run, then the mean of `reps` timed runs.
-    static func gpuDecode(_ vae: QwenImageVAE, _ z: MLXArray, route: Bool, reps: Int = 3)
-        -> (MLXArray, Double)
-    {
-        vae.winogradFreeConvs = route
-        defer { vae.winogradFreeConvs = true }
+    /// GPU decode on a conv route; warm-up run, then the mean of `reps` timed runs.
+    static func gpuDecode(
+        _ vae: QwenImageVAE, _ z: MLXArray, route: QwenVAEConvRoute, reps: Int = 3
+    ) -> (MLXArray, Double) {
+        let saved = vae.convRoute
+        vae.convRoute = route
+        defer { vae.convRoute = saved }
         var out = vae.decode(z)
         eval(out)
         let t0 = Date()
@@ -99,8 +100,8 @@ final class VAEGPULaneTests: XCTestCase {
         let ref = g["decoded"]!
 
         let cpu = Self.onCPU { vae.decode(z) }
-        let (route, _) = Self.gpuDecode(vae, z, route: true)
-        let (raw, _) = Self.gpuDecode(vae, z, route: false)
+        let (route, _) = Self.gpuDecode(vae, z, route: .conv3d)
+        let (raw, _) = Self.gpuDecode(vae, z, route: .winograd)
         // diffusers' _decode clamps to [-1, 1] (the golden includes it; noise overshoots a lot).
         func clamped(_ x: MLXArray) -> MLXArray { clip(x, min: -1, max: 1) }
         let sCPU = Self.stats(clamped(cpu), ref)
@@ -136,16 +137,18 @@ final class VAEGPULaneTests: XCTestCase {
         print(String(format: "  CPU-lane fp32 decode (reference): %.1f s", Date().timeIntervalSince(t0)))
         Memory.clearCache()  // the CPU lane leaves tens of GB pooled; don't time against that
 
-        let (r32, t32) = Self.gpuDecode(vae32, z, route: true)
-        let (w32, tw32) = Self.gpuDecode(vae32, z, route: false)
+        let (r32, t32) = Self.gpuDecode(vae32, z, route: .conv3d)
+        let (w32, tw32) = Self.gpuDecode(vae32, z, route: .winograd)
         let vae16 = try QwenImageEditWeights.loadVAE(directory: Self.vaeDir, dtype: .bfloat16)
-        let (r16, t16) = Self.gpuDecode(vae16, z, route: true)
-        let (w16, tw16) = Self.gpuDecode(vae16, z, route: false)
+        let (r16, t16) = Self.gpuDecode(vae16, z, route: .conv3d)
+        let (u16, tu16) = Self.gpuDecode(vae16, z, route: .fp32Winograd)
+        let (w16, tw16) = Self.gpuDecode(vae16, z, route: .winograd)
         let s = [
-            ("GPU fp32, route      ", Self.stats(r32, ref), t32),
-            ("GPU fp32, raw conv2d ", Self.stats(w32, ref), tw32),
-            ("GPU bf16, route      ", Self.stats(r16, ref), t16),
-            ("GPU bf16, raw conv2d ", Self.stats(w16, ref), tw16),
+            ("GPU fp32, conv3d route  ", Self.stats(r32, ref), t32),
+            ("GPU fp32, raw Winograd  ", Self.stats(w32, ref), tw32),
+            ("GPU bf16, conv3d route  ", Self.stats(r16, ref), t16),
+            ("GPU bf16, fp32 Winograd ", Self.stats(u16, ref), tu16),
+            ("GPU bf16, raw Winograd  ", Self.stats(w16, ref), tw16),
         ]
         print("  decode vs CPU-lane fp32:")
         for (label, st, ms) in s { print(String(format: "  %@ %@  %7.1f ms", label, st.description, ms)) }
@@ -160,16 +163,17 @@ final class VAEGPULaneTests: XCTestCase {
             let vae = try QwenImageEditWeights.loadVAE(directory: Self.vaeDir, dtype: dtype)
             let z = QwenImageVAE.deNormalize(vae.encode(pixels.asType(dtype)))
             eval(z)
-            var route = [Double](), raw = [Double]()
+            var t: [QwenVAEConvRoute: [Double]] = [:]
+            let routes: [QwenVAEConvRoute] = dtype == .float32 ? [.conv3d, .winograd] : [.conv3d, .fp32Winograd, .winograd]
             for _ in 0..<3 {
-                route.append(Self.gpuDecode(vae, z, route: true).1)
-                raw.append(Self.gpuDecode(vae, z, route: false).1)
+                for r in routes { t[r, default: []].append(Self.gpuDecode(vae, z, route: r).1) }
             }
-            print(String(format: "[timing 1024² %@] route %@ ms | raw %@ ms | delta %+.1f ms (median)",
-                         dtype == .float32 ? "fp32" : "bf16",
-                         route.map { String(format: "%.0f", $0) }.joined(separator: "/"),
-                         raw.map { String(format: "%.0f", $0) }.joined(separator: "/"),
-                         route.sorted()[1] - raw.sorted()[1]))
+            func median(_ v: [Double]) -> Double { v.sorted()[v.count / 2] }
+            let line = routes.map { r in
+                String(format: "%@ %@ ms (median %.0f)", r.rawValue,
+                       t[r]!.map { String(format: "%.0f", $0) }.joined(separator: "/"), median(t[r]!))
+            }.joined(separator: " | ")
+            print("[timing 1024² \(dtype == .float32 ? "fp32" : "bf16")] \(line)")
             Memory.clearCache()
         }
     }

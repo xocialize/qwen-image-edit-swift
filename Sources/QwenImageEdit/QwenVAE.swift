@@ -260,13 +260,11 @@ public final class QwenImageVAE: Module {
     /// intermediates); defaults to fp32, the parity-locked regime.
     public var weightDtype: DType = .float32
 
-    /// Whether the decoder's upsampler convs take the exact conv3d route (default) instead of
-    /// mlx's lossy Winograd conv2d. `false` is for A/B validation only (WinogradFreeConv2d.swift).
-    public var winogradFreeConvs: Bool {
-        get { modules().allSatisfy { ($0 as? WinogradFreeConv2d)?.enabled ?? true } }
-        set {
-            for case let conv as WinogradFreeConv2d in modules() { conv.enabled = newValue }
-        }
+    /// Route for the decoder's in-window upsampler convs (WinogradFreeConv2d.swift). Default
+    /// `.conv3d`: exact, and ~free here (3 convs). `.winograd` is mlx's raw path (A/B only).
+    public var convRoute: QwenVAEConvRoute {
+        get { modules().lazy.compactMap { ($0 as? WinogradFreeConv2d)?.route }.first ?? .conv3d }
+        set { for case let conv as WinogradFreeConv2d in modules() { conv.route = newValue } }
     }
 
     /// From vae/config.json (latents_mean / latents_std).
@@ -287,6 +285,7 @@ public final class QwenImageVAE: Module {
         self._decoder.wrappedValue = QwenImageVAEDecoder()
         self._encoder.wrappedValue = QwenImageVAEEncoder()
         super.init()
+        if let route = QwenVAEConvRoute.environmentOverride { convRoute = route }
     }
 
     /// latents: (B, 16, T, H, W) de-normalized -> image (B, 3, T, 8H, 8W).
