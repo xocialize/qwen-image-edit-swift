@@ -27,11 +27,14 @@ let package = Package(
         .library(name: "MLXQwenImageFlash", targets: ["MLXQwenImageFlash"]),
     ],
     dependencies: [
-        .package(url: "https://github.com/ml-explore/mlx-swift.git", from: "0.30.0"),
-        .package(url: "https://github.com/ml-explore/mlx-swift-lm.git", from: "3.31.3"),
+        // 0.32.3 carries the NAX split-K GEMM fix (mlx#3810): the FFN row-chunk and the bf16+LoRA
+        // size guard were removed on that basis, so older versions would corrupt 1366–4096-token
+        // renders. mlx-swift-lm 3.32.3 is the first release on that mlx-swift.
+        .package(url: "https://github.com/ml-explore/mlx-swift.git", from: "0.32.3"),
+        .package(url: "https://github.com/ml-explore/mlx-swift-lm.git", from: "3.32.3"),
         .package(url: "https://github.com/huggingface/swift-transformers", from: "1.1.6"),
         // VL encoder backbone + HF-exact image preprocessing (parity-locked); net dep.
-        .package(url: "https://github.com/xocialize/qwen25vl-mlx-swift", from: "0.1.0"),
+        .package(url: "https://github.com/xocialize/qwen25vl-mlx-swift", from: "0.4.0"),
         // MLXEngine contract (MLXToolKit) for the wrapper targets only. ≥0.27.0 for the CAN
         // cancellation gate (MLXServeConformance.CancellationConformance); ≥0.32.0 for
         // engine-executed materialization (contract 1.24: WeightSourcing +

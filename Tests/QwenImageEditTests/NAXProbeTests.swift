@@ -1,5 +1,5 @@
-// NAX split-K GEMM probe + the invariant that protects this DiT from it (mlx#3797, fixed
-// upstream by #3810).
+// NAX split-K GEMM regression guard for this DiT (mlx#3797, fixed upstream by #3810 and
+// shipped in mlx-swift 0.32.3).
 //
 // On mlx-swift ≤0.31.6 with MLX_METAL_JIT=ON, a half-precision matmul in the window
 //   M·N ≥ 2048² , K ≥ 10240 , K ≥ 3·max(M,N)
@@ -9,13 +9,13 @@
 // qualifying window is 1366 ≤ M ≤ 4096 image tokens — output grids from ~592² up to exactly
 // 1024². The EDIT path never entered it (target+conditioning tokens put M at 8192, where
 // K ≥ 3·M fails); the T2I path lands at M = 4096 at the model's tested 1024² size, dead on
-// the upper edge. `QwenFeedForward.downProjected` row-chunks at ≤896 to stay out of it.
+// the upper edge. `QwenFeedForward` used to row-chunk at ≤896 to stay out of it, and the
+// Flash package refused bf16 + LoRA at 1366–4096 image tokens; both are gone now that the
+// manifest requires mlx-swift 0.32.3.
 //
-// Measured on this box / mlx-swift 0.31.6 (raw GEMM, QIE_NAX_PROBE=1):
+// Measured on this box / mlx-swift 0.31.6 (raw GEMM):
 //   M=256 cos 0.99999887 · M=1366 cos 0.70700407 · M=2048 cos 0.0 · M=4096 NaN
-//
-// Removal path: bump the mlx-swift pin, run `QIE_NAX_PROBE=1 swift test --filter NAXProbeTests`;
-// when the raw probe PASSES edge-to-edge, delete the chunk in QwenFeedForward.
+// These probes are weights-free and run on every test pass; a failure means the fix regressed.
 
 import Foundation
 import MLX
@@ -46,12 +46,8 @@ final class NAXProbeTests: XCTestCase {
         return c.item(Float.self)
     }
 
-    /// Raw-GEMM diagnostic at the DiT FFN shape. EXPECTED TO FAIL while the pin is ≤0.31.6 —
-    /// it is the removal signal for the row-chunk, not a health check, hence env-gated.
+    /// Raw GEMM at the DiT FFN shape, across the old corruption window.
     func testFeedForwardGEMMWindow() throws {
-        try XCTSkipUnless(
-            ProcessInfo.processInfo.environment["QIE_NAX_PROBE"] == "1",
-            "set QIE_NAX_PROBE=1 — diagnostic; fails by design until mlx-swift vendors #3810")
         let (K, N) = (12288, 3072)
         let b = Self.lcgArray([N, K]).asType(.bfloat16)
         // 256 = the parity-golden grid (below the window); 1366 = first qualifying M;
@@ -76,8 +72,7 @@ final class NAXProbeTests: XCTestCase {
     ///
     /// This is the shape a rank-32 adapter on `img_mlp.proj_out` introduces, and it is the
     /// classic split-K candidate — enormous K, tiny N — which is exactly the family mlx#3797
-    /// mis-instantiates. It is NOT covered by `QwenFeedForward.downProjected`'s row-chunk,
-    /// because that chunks the BASE projection; this matmul lives inside the adapter.
+    /// mis-instantiates. It lives inside the adapter, not the base projection.
     /// Symptom when it corrupts: a LoRA render is clean below ~1366 image tokens (512²) and
     /// becomes banded static at 1024², while the same LoRA at int8 is fine.
     func testLoRAAdapterGEMMShape() throws {
@@ -138,10 +133,9 @@ final class NAXProbeTests: XCTestCase {
         }
     }
 
-    /// The invariant that keeps 1024² T2I renderable on the current pin: the row-chunked
-    /// down-projection must match the fp32 reference at M = 4096, where the unchunked bf16
-    /// GEMM returns NaN. Random weights — this tests the kernel path, not the model.
-    func testChunkedFeedForwardIsExactAtProductionGrid() {
+    /// The bf16 FFN must match the fp32 reference at M = 4096 (1024² T2I), where the bf16
+    /// GEMM returned NaN on mlx-swift ≤0.31.6. Random weights — this tests the kernel path.
+    func testFeedForwardIsExactAtProductionGrid() {
         let (dim, hidden) = (3072, 12288)
         let ff = QwenFeedForward(dim: dim, hiddenDim: hidden)
         ff.update(parameters: ModuleParameters.unflattened([
@@ -152,15 +146,15 @@ final class NAXProbeTests: XCTestCase {
         ]))
         eval(ff)
 
-        let m = 4096  // 1024² T2I image tokens — the NaN case unchunked
+        let m = 4096  // 1024² T2I image tokens — the NaN case on ≤0.31.6
         let x = (Self.lcgArray([1, m, dim], seed: 33) * 0.5).asType(.bfloat16)
-        let chunked = ff(x)
-        eval(chunked)
+        let out = ff(x)
+        eval(out)
         XCTAssertTrue(
-            chunked.asType(.float32).max().item(Float.self).isFinite,
-            "chunked down-projection produced non-finite output at M=\(m)")
+            out.asType(.float32).max().item(Float.self).isFinite,
+            "FFN produced non-finite output at M=\(m)")
 
-        // fp32 reference: the dtype guard routes fp32 straight through, unchunked.
+        // fp32 reference.
         let ff32 = QwenFeedForward(dim: dim, hiddenDim: hidden)
         ff32.update(parameters: ModuleParameters.unflattened([
             "proj_in.weight": ff.projIn.weight.asType(.float32),
@@ -172,8 +166,8 @@ final class NAXProbeTests: XCTestCase {
         let reference = ff32(x.asType(.float32))
         eval(reference)
 
-        let cos = Self.cosine(chunked, reference)
-        print(String(format: "  chunked FFN @ M=%d: cos %.8f", m, cos))
-        XCTAssertGreaterThan(cos, 0.999, "row-chunked down-projection diverged from fp32")
+        let cos = Self.cosine(out, reference)
+        print(String(format: "  FFN @ M=%d: cos %.8f", m, cos))
+        XCTAssertGreaterThan(cos, 0.999, "bf16 FFN diverged from fp32")
     }
 }
