@@ -58,35 +58,36 @@ final class EncoderParityTests: XCTestCase {
         let imagePath = meta["input_image"] as! String
 
         let fp32Pre = ProcessInfo.processInfo.environment["QIE_FP32_CPU"] == "1"
-        if fp32Pre { Device.setDefault(device: Device(.cpu)) }
-        let encoder = try await QwenVLPromptEncoder.load(
-            snapshot: Self.modelDir, dtype: fp32Pre ? .float32 : .bfloat16)
-        let image = try Self.loadRGB(url: URL(fileURLWithPath: imagePath))
+        try await withCPUReferenceLane(fp32Pre) {
+            let encoder = try await QwenVLPromptEncoder.load(
+                snapshot: Self.modelDir, dtype: fp32Pre ? .float32 : .bfloat16)
+            let image = try Self.loadRGB(url: URL(fileURLWithPath: imagePath))
 
-        func gate(_ text: String, _ goldenKey: String) throws -> Float {
-            let ours = try encoder.encode(prompt: text, images: [image])
-            let ref = enc[goldenKey]!
-            XCTAssertEqual(
-                ours.dim(1), ref.dim(1),
-                "\(goldenKey): token count \(ours.dim(1)) != golden \(ref.dim(1))")
-            let a = ours.asType(.float32).flattened()
-            let b = ref.asType(.float32).flattened()
-            let cos = sum(a * b) / (sqrt(sum(a * a)) * sqrt(sum(b * b)) + 1e-12)
-            eval(cos)
-            let c = cos.item(Float.self)
-            print("\(goldenKey): cosine \(c) (S=\(ours.dim(1)))")
-            return c
+            func gate(_ text: String, _ goldenKey: String) throws -> Float {
+                let ours = try encoder.encode(prompt: text, images: [image])
+                let ref = enc[goldenKey]!
+                XCTAssertEqual(
+                    ours.dim(1), ref.dim(1),
+                    "\(goldenKey): token count \(ours.dim(1)) != golden \(ref.dim(1))")
+                let a = ours.asType(.float32).flattened()
+                let b = ref.asType(.float32).flattened()
+                let cos = sum(a * b) / (sqrt(sum(a * a)) * sqrt(sum(b * b)) + 1e-12)
+                eval(cos)
+                let c = cos.item(Float.self)
+                print("\(goldenKey): cosine \(c) (S=\(ours.dim(1)))")
+                return c
+            }
+
+            // Gates calibrated 2026-06-12 (post sequential-RoPE fix): fp32-CPU full path
+            // reads 0.9977 overall / 0.99724 vision-span — residual is ±1-LSB resize
+            // noise amplified by ViT massive activations (same regime as the Lens
+            // encoder 0.997 gates). bf16 GPU reads 0.974.
+            let fp32CPU = ProcessInfo.processInfo.environment["QIE_FP32_CPU"] == "1"
+            let gateValue: Float = fp32CPU ? 0.995 : 0.97
+            let cosPos = try gate(prompt, "prompt_embeds")
+            XCTAssertGreaterThanOrEqual(cosPos, gateValue)
+            let cosNeg = try gate(negative, "neg_embeds")
+            XCTAssertGreaterThanOrEqual(cosNeg, gateValue)
         }
-
-        // Gates calibrated 2026-06-12 (post sequential-RoPE fix): fp32-CPU full path
-        // reads 0.9977 overall / 0.99724 vision-span — residual is ±1-LSB resize
-        // noise amplified by ViT massive activations (same regime as the Lens
-        // encoder 0.997 gates). bf16 GPU reads 0.974.
-        let fp32CPU = ProcessInfo.processInfo.environment["QIE_FP32_CPU"] == "1"
-        let gateValue: Float = fp32CPU ? 0.995 : 0.97
-        let cosPos = try gate(prompt, "prompt_embeds")
-        XCTAssertGreaterThanOrEqual(cosPos, gateValue)
-        let cosNeg = try gate(negative, "neg_embeds")
-        XCTAssertGreaterThanOrEqual(cosNeg, gateValue)
     }
 }

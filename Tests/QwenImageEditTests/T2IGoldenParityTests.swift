@@ -32,9 +32,8 @@ final class T2IGoldenParityTests: XCTestCase {
         try XCTSkipUnless(
             ProcessInfo.processInfo.environment["QIF_PARITY"] == "1",
             "set QIF_PARITY=1 to run (loads the 20B transformer / 7B encoder)")
-        let fp32CPU = ProcessInfo.processInfo.environment["QIF_FP32_CPU"] == "1"
-        if fp32CPU { Device.setDefault(device: Device(.cpu)) }
-        return fp32CPU
+        // The fp32 CPU stream is scoped per test via withCPUReferenceLane (see that file).
+        return ProcessInfo.processInfo.environment["QIF_FP32_CPU"] == "1"
     }
 
     private func meta() throws -> [String: Any] {
@@ -54,23 +53,25 @@ final class T2IGoldenParityTests: XCTestCase {
     /// 64) through the Qwen2.5-VL backbone, truncated to 512 tokens.
     func testPromptEmbeds() async throws {
         let fp32CPU = try requireParity()
-        let ref = try MLX.loadArrays(
-            url: Self.goldens.appendingPathComponent("prompt_embeds.safetensors"))
-        let m = try meta()
-        let prompt = m["prompt"] as! String
+        try await withCPUReferenceLane(fp32CPU) {
+            let ref = try MLX.loadArrays(
+                url: Self.goldens.appendingPathComponent("prompt_embeds.safetensors"))
+            let m = try meta()
+            let prompt = m["prompt"] as! String
 
-        let encoder = try await QwenVLPromptEncoder.loadTextOnly(
-            snapshot: Self.modelDir, dtype: fp32CPU ? .float32 : .bfloat16)
-        let ours = try encoder.encodeText(prompt: prompt)
-        let golden = ref["prompt_embeds"]!
+            let encoder = try await QwenVLPromptEncoder.loadTextOnly(
+                snapshot: Self.modelDir, dtype: fp32CPU ? .float32 : .bfloat16)
+            let ours = try encoder.encodeText(prompt: prompt)
+            let golden = ref["prompt_embeds"]!
 
-        XCTAssertEqual(
-            ours.shape, golden.shape,
-            "token count must match the reference — a drop_idx or template mismatch shows up "
-                + "here first (edit=64 vs t2i=34)")
-        let cos = cosine(ours, golden)
-        print("prompt_embeds: cosine \(cos)  shape \(ours.shape)")
-        XCTAssertGreaterThanOrEqual(cos, fp32CPU ? 0.9999 : 0.99)
+            XCTAssertEqual(
+                ours.shape, golden.shape,
+                "token count must match the reference — a drop_idx or template mismatch shows up "
+                    + "here first (edit=64 vs t2i=34)")
+            let cos = cosine(ours, golden)
+            print("prompt_embeds: cosine \(cos)  shape \(ours.shape)")
+            XCTAssertGreaterThanOrEqual(cos, fp32CPU ? 0.9999 : 0.99)
+        }
     }
 
     /// S1: DiT step-0 forward on the reference's own packed noise. This is the gate that
@@ -78,34 +79,36 @@ final class T2IGoldenParityTests: XCTestCase {
     /// `zero_cond_t=false` branch.
     func testDiTStep0() throws {
         let fp32CPU = try requireParity()
-        let dit = try MLX.loadArrays(
-            url: Self.goldens.appendingPathComponent("dit_step0.safetensors"))
-        let enc = try MLX.loadArrays(
-            url: Self.goldens.appendingPathComponent("prompt_embeds.safetensors"))
-        let m = try meta()
-        let w = m["width"] as! Int
-        let h = m["height"] as! Int
-        let sigmas = (m["sigmas"] as! [NSNumber]).map(\.floatValue)
+        try withCPUReferenceLane(fp32CPU) {
+            let dit = try MLX.loadArrays(
+                url: Self.goldens.appendingPathComponent("dit_step0.safetensors"))
+            let enc = try MLX.loadArrays(
+                url: Self.goldens.appendingPathComponent("prompt_embeds.safetensors"))
+            let m = try meta()
+            let w = m["width"] as! Int
+            let h = m["height"] as! Int
+            let sigmas = (m["sigmas"] as! [NSNumber]).map(\.floatValue)
 
-        let dtype: DType = fp32CPU ? .float32 : .bfloat16
-        let model = try QwenImageEditWeights.loadDiTFromPT(
-            directory: Self.modelDir.appendingPathComponent("transformer"), dtype: dtype)
+            let dtype: DType = fp32CPU ? .float32 : .bfloat16
+            let model = try QwenImageEditWeights.loadDiTFromPT(
+                directory: Self.modelDir.appendingPathComponent("transformer"), dtype: dtype)
 
-        let out = model(
-            hiddenStates: dit["hidden_in"]!.asType(dtype),
-            encoderHiddenStates: enc["prompt_embeds"]!.asType(dtype),
-            encoderHiddenStatesMask: nil,  // single prompt -> mask is all ones
-            timestep: MLXArray([sigmas[0]]),
-            imgShapes: [(1, h / 16, w / 16)])
+            let out = model(
+                hiddenStates: dit["hidden_in"]!.asType(dtype),
+                encoderHiddenStates: enc["prompt_embeds"]!.asType(dtype),
+                encoderHiddenStatesMask: nil,  // single prompt -> mask is all ones
+                timestep: MLXArray([sigmas[0]]),
+                imgShapes: [(1, h / 16, w / 16)])
 
-        let cos = cosine(out, dit["out"]!)
-        print("dit_step0: cosine \(cos)  σ0 \(sigmas[0])  grid \(h / 16)×\(w / 16)")
-        // bf16 threshold is looser than the edit gate's 0.9985 BY DESIGN: that one was
-        // calibrated at ~8k tokens, this golden is 256 tokens, and per-element bf16 error
-        // averages out with sequence length (measured 0.99836 here vs 0.99986 there — the
-        // ~sqrt(N) ratio). The fp32-CPU stream is the defect discriminator and measures
-        // 1.0000002, i.e. the T2I path is exact; only GPU half-precision noise remains.
-        XCTAssertGreaterThanOrEqual(cos, fp32CPU ? 0.9999 : 0.998)
+            let cos = cosine(out, dit["out"]!)
+            print("dit_step0: cosine \(cos)  σ0 \(sigmas[0])  grid \(h / 16)×\(w / 16)")
+            // bf16 threshold is looser than the edit gate's 0.9985 BY DESIGN: that one was
+            // calibrated at ~8k tokens, this golden is 256 tokens, and per-element bf16 error
+            // averages out with sequence length (measured 0.99836 here vs 0.99986 there — the
+            // ~sqrt(N) ratio). The fp32-CPU stream is the defect discriminator and measures
+            // 1.0000002, i.e. the T2I path is exact; only GPU half-precision noise remains.
+            XCTAssertGreaterThanOrEqual(cos, fp32CPU ? 0.9999 : 0.998)
+        }
     }
 
     /// E2E at the model's tested production size (1024²) — the largest-production-grid rule:
