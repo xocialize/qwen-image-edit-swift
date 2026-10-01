@@ -65,7 +65,12 @@ public enum QwenImageEditWeights {
     public static func loadVAE(directory: URL, dtype: DType = .float32) throws -> QwenImageVAE {
         let vae = QwenImageVAE()
         var state: [String: MLXArray] = [:]
-        for (rawKey, rawValue) in try loadAllArrays(directory: directory) {
+        let raw = try loadAllArrays(directory: directory)
+        // Read the files on the CPU stream first. The transposes/casts below are GPU ops, and a GPU
+        // command buffer that waits on a slow read (an idle external drive spinning up) trips the
+        // 5 s GPU watchdog.
+        eval(Array(raw.values))
+        for (rawKey, rawValue) in raw {
             let k = sanitizeVAEKey(rawKey)
             var v = rawValue
             if k.hasSuffix("gamma") {  // (C,1,1,1)/(C,1,1) -> (C) channels-last

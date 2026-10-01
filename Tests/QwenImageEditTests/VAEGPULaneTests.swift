@@ -48,8 +48,15 @@ final class VAEGPULaneTests: XCTestCase {
         return Stats(relL2: rel.item(Float.self), maxAbs: mx.item(Float.self), psnr: psnr)
     }
 
+    /// Compile is off inside the lane: mlx's compile cache keys on the C++ default stream, which
+    /// withDefaultDevice leaves on the GPU, so MLXNN's compiled silu traced on the GPU by an earlier
+    /// test would replay on the GPU here. Its command buffers then wait on CPU-stream progress and
+    /// trip the 5 s GPU watchdog (kIOGPUCommandBufferCallbackErrorTimeout); traced here first, the
+    /// GPU lane would run silu on the CPU instead.
     static func onCPU(_ f: () -> MLXArray) -> MLXArray {
-        Device.withDefaultDevice(.cpu) { () -> MLXArray in
+        compile(enable: false)
+        defer { compile(enable: true) }
+        return Device.withDefaultDevice(.cpu) { () -> MLXArray in
             let r = f()
             eval(r)
             return r
@@ -96,6 +103,7 @@ final class VAEGPULaneTests: XCTestCase {
         try XCTSkipUnless(Self.env["QIE_PARITY"] == "1", "set QIE_PARITY=1 to run")
         let vae = try QwenImageEditWeights.loadVAE(directory: Self.vaeDir, dtype: .float32)
         let g = try MLX.loadArrays(url: Self.golden)
+        eval(Array(g.values))  // read the file before a GPU op waits on it (see loadVAE)
         let z = QwenImageVAE.deNormalize(g["latent_in"]!.asType(.float32))
         let ref = g["decoded"]!
 
