@@ -221,14 +221,15 @@ public final class QwenImageT2IGenerator {
         lastStepCacheSkips = (posStepCache != nil || negStepCache != nil)
             ? (posStepCache?.skippedSteps ?? 0, negStepCache?.skippedSteps ?? 0) : nil
 
-        // CAN seam: denoise done, before the monolithic VAE decode (one MLX eval).
+        // CAN seam: denoise done, before the VAE decode.
         try Task.checkCancellation()
 
-        // 5. Decode.
+        // 5. Decode. Up to 160² latent tokens (every 1024-bucket size) this is the plain decode;
+        // above, chunked attention + a halo-tiled up path keep the transient ≤ the 1024² decode's.
         let dSpan = prof.begin("vae-decode", "decode")
         let unpacked = QwenImagePipeline.unpackLatents(
             latents.asType(.float32), pixelHeight: th, pixelWidth: tw)
-        let decoded = vae.decode(QwenImageVAE.deNormalize(unpacked))  // (1,3,1,H,W)
+        let decoded = vae.decodeBounded(QwenImageVAE.deNormalize(unpacked))  // (1,3,1,H,W)
         let img = clip((decoded.squeezed(axis: 2) + 1) * 127.5, min: 0, max: 255)
             .asType(.uint8)
         let hwc = img[0].transposed(1, 2, 0)

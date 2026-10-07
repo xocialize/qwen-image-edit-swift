@@ -86,6 +86,29 @@ For A/B validation, set `QIE_VAE_CONV_ROUTE=winograd` or `vae.convRoute = .winog
 raw conv2d. The golden path in `VAEDecodeParityTests` (DEV_VOL1) no longer exists, so `VAEGPULaneTests`
 uses the Flash golden instead; the VAE weights are byte-identical.
 
+### Bounded decode above the 1024 bucket (2026-10-07, AB-L-0176)
+
+The VAE decode transient grows faster than the latent area. Two terms drive it:
+- **The mid-block attention.** It is global and single-head, and it materialises an (h·w)² fp32 score matrix: 3.0 GB at 1328², 17.2 GB at 2048².
+- **The untiled up path.** It is 27.7 GB at 2048².
+
+`QwenImageVAE.decodeBounded` fixes both: the mid attention runs in 4096-row query chunks, and the up path is tiled (96-latent tiles, 16-px halo, interior kept). Each lever alone saves nothing, because the other one stays the peak. The Flash T2I pipeline decodes through it. Up to `untiledDecodeMaxTokens` (160², every 1024-bucket size and every ~1 MP edit output) it is plain `decode`, byte-identical. The edit pipelines and `encode` are unchanged.
+
+| fp32, GPU (M5 Max) | v0.9.0 `decode` | `decodeBounded` | vs `decode` |
+|---|---|---|---|
+| 1024² | 6.93 GB · 1.24 s | same path | byte-identical |
+| 1328² | 11.66 GB · 2.14 s | 5.30 GB · 3.14 s | relL2 6.7e-7, 156 of 5.3M uint8 samples ±1 |
+| 2048² | 27.72 GB · 5.61 s | 7.00 GB · 8.51 s | relL2 6.7e-7, 422 of 12.6M ±1 |
+| 1440×2560 | 24.36 GB · 4.98 s | 6.12 GB · 7.52 s | relL2 6.7e-7, 355 of 11.1M ±1 |
+
+The halo tiling is exact: the error is identical at tiles 64, 96 and 128. All of it comes from the chunked attention's GEMM shapes.
+
+Whole-request int8 Flash T2I (4 steps, MLX peak − floor):
+- **1024²:** 7.8 GB, unchanged.
+- **1328²:** 11.7 GB → 5.3 GB. The unbounded 1328² decode exceeded the declared 9.3 GB; the bounded one is under it.
+
+Gates: `QIE_VAECHUNK=1 swift test -c release -Xswiftc -enable-testing --filter VAEAttnChunkTests`, and `QIF_QUANT_GATE=1 QIF_MEMBENCH_SIZES=1024,1328 [QIF_MEMBENCH_UNBOUNDED=1] … --filter FlashQuantGateTests/testInt8MemBench`.
+
 ## Use
 
 ```swift

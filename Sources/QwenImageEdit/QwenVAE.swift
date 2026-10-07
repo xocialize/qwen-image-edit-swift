@@ -104,11 +104,19 @@ public final class WanResBlock: Module {
 }
 
 /// Single-head 2D self-attention applied per frame (mid-block only).
+///
+/// Its (h·w)² score matrix grows with the square of the latent area: 1.07 GB fp32 at 1024², 3.0 GB
+/// at 1328², 17.2 GB at 2048² (AB-L-0176). With `queryChunk` set (`QwenImageVAE.decodeBounded`
+/// sets it on the decoder's mid block) the queries run in row chunks. Softmax is per query row, so
+/// the formula is unchanged; only GEMM shapes differ (relL2 ≈ 7e-7). With nil (the default, and
+/// every encode) it is the reference's single softmax(QKᵀ)V.
 public final class WanAttentionBlock: Module {
     @ModuleInfo(key: "norm") var norm: WanRMSNorm
     @ModuleInfo(key: "to_qkv") var toQKV: Conv2d
     @ModuleInfo(key: "proj") var proj: Conv2d
     let dim: Int
+    /// Query rows per chunk, or nil for the single-matmul reference path.
+    var queryChunk: Int?
 
     public init(dim: Int) {
         self.dim = dim
@@ -130,8 +138,22 @@ public final class WanAttentionBlock: Module {
         let k = qkv[0..., 0..., 1]
         let v = qkv[0..., 0..., 2]
         let scale = 1.0 / sqrt(Float(c))
-        let scores = softmax(matmul(q, k.transposed(0, 2, 1)) * scale, axis: -1)
-        var out = matmul(scores, v).reshaped(b * t, h, w, c)
+        let kT = k.transposed(0, 2, 1)
+        let n = h * w
+        var out: MLXArray
+        if let queryChunk, n > queryChunk {
+            var parts: [MLXArray] = []
+            for r in stride(from: 0, to: n, by: queryChunk) {
+                let scores = softmax(matmul(q[0..., r ..< min(r + queryChunk, n)], kT) * scale, axis: -1)
+                let part = matmul(scores, v)
+                eval(part)  // one chunk's scores at a time
+                parts.append(part)
+            }
+            out = concatenated(parts, axis: 1).reshaped(b * t, h, w, c)
+        } else {
+            let scores = softmax(matmul(q, kT) * scale, axis: -1)
+            out = matmul(scores, v).reshaped(b * t, h, w, c)
+        }
         out = proj(out)
         return out.reshaped(b, t, h, w, c) + identity
     }
@@ -297,6 +319,56 @@ public final class QwenImageVAE: Module {
         x = postQuantConv(x)
         x = decoder(x)
         return x.transposed(0, 4, 1, 2, 3)  // -> (B, C, T, H, W)
+    }
+
+    /// Latent token count (h·w) up to which `decodeBounded` is plain `decode`. The default 160²
+    /// covers every 1024-bucket size and every ~1 MP edit output (≤ 18,240 tokens), so the gated
+    /// paths never change. `Int.max` disables bounding (the v0.9.0 decode at every size).
+    public var untiledDecodeMaxTokens = 160 * 160
+
+    /// `decode` in bounded memory above `untiledDecodeMaxTokens` (AB-L-0176). Two levers, and it
+    /// needs both. On its own each saves nothing, because the other one becomes the peak:
+    /// - the mid block's global attention runs in 4096-row query chunks (≈ 1 GB of scores each at
+    ///   2048²). Its (h·w)² fp32 scores are 17.2 GB at 2048² unchunked;
+    /// - the up path, 27.7 GB at 2048² untiled, is tiled over the latent grid.
+    ///
+    /// Exact up to GEMM shape. The mid block runs on the whole latent. Everything after it is local:
+    /// causal 3×3×3 convs at T = 1, per-pixel WanRMS norms, nearest-2× upsampling. Its receptive
+    /// radius is ≈ 12.3 latent pixels: 6 convs at 1×, then 1 + 6 at each of 2×, 4× and 8×, then
+    /// conv_out. Each tile carries a `halo` ≥ that radius of real neighbouring latent and keeps only
+    /// its interior. The recipe is ming-image-swift's `MingVAE.decodeTiled`.
+    public func decodeBounded(_ latents: MLXArray, tile: Int = 96, halo: Int = 16) -> MLXArray {
+        let (h, w) = (latents.dim(3), latents.dim(4))
+        guard h * w > untiledDecodeMaxTokens else { return decode(latents) }
+        var x = latents.asType(weightDtype).transposed(0, 2, 3, 4, 1)  // -> (B, T, H, W, C)
+        let attention = decoder.midBlock.attentions[0]
+        attention.queryChunk = 4096
+        x = decoder.midBlock(decoder.convIn(postQuantConv(x)))
+        eval(x)
+        attention.queryChunk = nil
+        let s = 8  // latent → pixel scale of the up path
+        var rows: [MLXArray] = []
+        for y0 in stride(from: 0, to: h, by: tile) {
+            var cols: [MLXArray] = []
+            for x0 in stride(from: 0, to: w, by: tile) {
+                let (ys, ye) = (max(0, y0 - halo), min(h, y0 + tile + halo))
+                let (xs, xe) = (max(0, x0 - halo), min(w, x0 + tile + halo))
+                var t = x[0..., 0..., ys ..< ye, xs ..< xe, 0...]
+                for block in decoder.upBlocks {
+                    t = block(t)
+                    eval(t)  // one up block's intermediates at a time
+                }
+                t = decoder.convOut(silu(decoder.normOut(t)))
+                let (ky, kx) = ((y0 - ys) * s, (x0 - xs) * s)
+                let (ny, nx) = (min(tile, h - y0) * s, min(tile, w - x0) * s)
+                let kept = t[0..., 0..., ky ..< (ky + ny), kx ..< (kx + nx), 0...]
+                eval(kept)  // bound the transient to this tile
+                cols.append(kept)
+            }
+            rows.append(cols.count == 1 ? cols[0] : concatenated(cols, axis: 3))
+        }
+        let full = rows.count == 1 ? rows[0] : concatenated(rows, axis: 2)
+        return full.transposed(0, 4, 1, 2, 3)  // -> (B, C, T, H, W)
     }
 
     /// Pipeline-side de-normalization: packedLatents (B, 16, T, H, W) normalized.

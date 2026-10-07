@@ -216,6 +216,11 @@ public final class QwenImageFlashPackage: ModelPackage {
                 // bf16's 0.99836; encoder 0.99992) and 4× faster end-to-end — 19.8 s vs 83.3 s
                 // at 1024²/4 steps, with a 2.3 s load instead of ~60 s. This is the tier that
                 // makes the model reachable below a 128 GB machine.
+                //
+                // Above the 1024 bucket the decode goes through `QwenImageVAE.decodeBounded`
+                // (v0.9.1, AB-L-0176). Before it, the unbounded VAE decode set the int8 peak at
+                // 1328², Qwen-Image's native size: activation 11.7 GB, over the 9.3 declared. Now
+                // it is 5.3 GB. At 1024² the activation is unchanged at 7.8 GB, so these rows stand.
                 footprints: [
                     QuantFootprint(
                         quant: .bf16, residentBytes: 41_400_000_000,

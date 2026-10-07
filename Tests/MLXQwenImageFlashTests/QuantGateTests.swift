@@ -12,6 +12,8 @@
 // an image-space metric reads as failure even when the tier is fine.
 //
 // Run: QIF_QUANT_GATE=1 swift test --filter FlashQuantGateTests
+// Membench size sweep: QIF_QUANT_GATE=1 QIF_MEMBENCH_SIZES=1024,1328 [QIF_MEMBENCH_UNBOUNDED=1] \
+//      swift test -c release -Xswiftc -enable-testing --filter FlashQuantGateTests/testInt8MemBench
 
 import Foundation
 import MLX
@@ -115,19 +117,27 @@ final class FlashQuantGateTests: XCTestCase {
             },
             transformer: transformer, vae: vae, shift: 3.0)
 
-        MLX.GPU.clearCache()
-        MLX.GPU.resetPeakMemory()
-        _ = try await generator.generate(
-            prompt: "A red fox in a snowy pine forest at golden hour, photorealistic",
-            width: 1024, height: 1024, steps: 4, trueCFGScale: 1.0, seed: 42,
-            progress: { _, _ in })
-        let peak = Double(MLX.GPU.peakMemory) / gb
-        let activation = max(0, peak - floor)
-        print(String(
-            format: "[membench int8] 1024x1024 4-step | peak %.1f GB | floor %.1f GB | "
-                + "activation %.1f GB", peak, floor, activation))
-        print(String(
-            format: "[membench int8] DECLARE -> residentBytes=%.0f  peakActivationBytes=%.0f "
-                + "(+20%% -> %.0f)", floor * gb, activation * gb, activation * 1.2 * gb))
+        // QIF_MEMBENCH_SIZES=1024,1328 sweeps square sizes; QIF_MEMBENCH_UNBOUNDED=1 measures
+        // the v0.9.0 decode (no chunked attention, no tiled up path) for the before/after.
+        let env = ProcessInfo.processInfo.environment
+        let sizes = (env["QIF_MEMBENCH_SIZES"] ?? "1024").split(separator: ",").compactMap { Int($0) }
+        if env["QIF_MEMBENCH_UNBOUNDED"] == "1" { vae.untiledDecodeMaxTokens = .max }
+        let decodeLabel = env["QIF_MEMBENCH_UNBOUNDED"] == "1" ? "unbounded decode" : "bounded decode"
+        for side in sizes {
+            MLX.GPU.clearCache()
+            MLX.GPU.resetPeakMemory()
+            _ = try await generator.generate(
+                prompt: "A red fox in a snowy pine forest at golden hour, photorealistic",
+                width: side, height: side, steps: 4, trueCFGScale: 1.0, seed: 42,
+                progress: { _, _ in })
+            let peak = Double(MLX.GPU.peakMemory) / gb
+            let activation = max(0, peak - floor)
+            print(String(
+                format: "[membench int8] %dx%d 4-step, %@ | peak %.1f GB | floor %.1f GB | "
+                    + "activation %.1f GB", side, side, decodeLabel, peak, floor, activation))
+            print(String(
+                format: "[membench int8] DECLARE -> residentBytes=%.0f  peakActivationBytes=%.0f "
+                    + "(+20%% -> %.0f)", floor * gb, activation * gb, activation * 1.2 * gb))
+        }
     }
 }
