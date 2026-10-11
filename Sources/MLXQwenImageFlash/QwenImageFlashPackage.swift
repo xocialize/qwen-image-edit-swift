@@ -179,6 +179,20 @@ public enum QwenImageFlashPackageError: Error, LocalizedError {
     }
 }
 
+/// Forwards the core's ambient phase events into the engine's `RunProgress` plane (contract
+/// 1.18.0, ENGINE-NEEDS V2; AB-A-0139). The engine binds `RunProgress.sink` as a task-local
+/// around `run()`; the core reports into its own engine-free `QwenImageEditProgress` sink, and
+/// this closure joins the two. The core's phase names ARE the canonical `RunPhase` constants, so
+/// raw values forward with no mapping table.
+///
+/// Namespaced rather than inlined so the offline suite can exercise the mapping without weights.
+enum QwenProgressBridge {
+    static let forward: QwenImageEditProgress.Sink = { e in
+        RunProgress.report(RunPhase(rawValue: e.phase.rawValue),
+                           step: e.step, totalSteps: e.totalSteps)
+    }
+}
+
 @InferenceActor
 public final class QwenImageFlashPackage: ModelPackage {
     public typealias Configuration = QwenImageFlashConfiguration
@@ -360,17 +374,22 @@ public final class QwenImageFlashPackage: ModelPackage {
 
         let prof = MLXProfiler.shared
         prof.beginRun("qwen-image-flash textToImage steps=\(steps) \(width)x\(height)")
-        let (pixels, w, h) = try await generator.generate(
-            prompt: t2i.prompt,
-            negativePrompt: t2i.negativePrompt ?? " ",
-            width: width, height: height,
-            steps: steps,
-            trueCFGScale: trueCFG,
-            seed: t2i.seed ?? 0,
-            progress: { _, _ in })
+        let (pixels, w, h) = try await QwenImageEditProgress.$sink.withValue(
+            QwenProgressBridge.forward
+        ) {
+            try await generator.generate(
+                prompt: t2i.prompt,
+                negativePrompt: t2i.negativePrompt ?? " ",
+                width: width, height: height,
+                steps: steps,
+                trueCFGScale: trueCFG,
+                seed: t2i.seed ?? 0,
+                progress: { _, _ in })
+        }
         prof.endRun(denominators: ["step": Double(steps)])
 
         try Task.checkCancellation()
+        RunProgress.report(.postprocess)
         let png = try Self.encodePNG(pixels: pixels, width: w, height: h)
         return T2IResponse(image: Image(format: .png, data: png, width: w, height: h))
     }

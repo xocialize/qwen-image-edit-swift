@@ -129,6 +129,23 @@ Behavior notes: the schema is **multi-image-first** (`images[]`, in prompt order
 "Picture 2", …), but the core pipeline currently consumes a single conditioning image; multi-image
 fusion (per-image VAE sizes + grids) is the tracked follow-up. `guidanceScale` is the true-CFG scale.
 
+## Run-phase progress (v0.9.3, AB-A-0139)
+
+The packages report into the engine's `RunProgress` plane (contract 1.18.0), so a host shows
+`denoise 5/8` instead of an unexplained "running". The phases, in order:
+
+| phase | covers | steps? |
+|---|---|---|
+| `encode` | Qwen2.5-VL-7B conditioning, including the per-request encoder load (skipped on a prompt-memo hit), and the VAE encode of the conditioning images on the edit path | no |
+| `denoise` | the flow-matching Euler loop: once at loop entry with no step, then after each completed step | **yes** — `step i/N`, 1-based |
+| `decode` | Qwen-Image VAE decode — reported once; the bounded decode above the 1024 bucket tiles internally | no |
+| `postprocess` | PNG encode (reported by the wrapper, after the model is done) | no |
+
+The core stays engine-free: `QwenImageEdit` reports into its own `QwenImageEditProgress` task-local sink, and
+each wrapper target (`MLXQwenImageEdit`, `MLXQwenImageEditTurbo`, `MLXTeleStyle`, `MLXQwenImageFlash`) forwards those events into `RunProgress` (`QwenProgressBridge`). Nothing bound ⇒ no-op, so the
+CLI and the parity gates run unchanged. A host binds a sink around `engine.run` (contract 1.51.0)
+or reads `engine.runProgress`.
+
 ## Status / consuming this package
 
 The **MLX-converted** weights are not yet on the Hub (the PyTorch source `Qwen/Qwen-Image-Edit-2511`

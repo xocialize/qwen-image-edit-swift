@@ -148,6 +148,7 @@ public final class QwenImageT2IGenerator {
         //    matching the reference `do_true_cfg`.
         let doCFG = trueCFGScale > 1
         let prof = MLXProfiler.shared
+        QwenImageEditProgress.report(.encode)
         let promptKey = PromptCacheKey(
             prompt: prompt, negativePrompt: doCFG ? negativePrompt : nil)
         let posEmbeds: MLXArray
@@ -193,6 +194,7 @@ public final class QwenImageT2IGenerator {
         // 4. Denoise loop.
         let posStepCache = stepCache.threshold.map { DiTStepCache(threshold: $0) }
         let negStepCache = doCFG ? stepCache.threshold.map { DiTStepCache(threshold: $0) } : nil
+        QwenImageEditProgress.report(.denoise)
         for i in 0..<steps {
             // CAN cadence: one cooperative checkpoint per denoise step.
             try Task.checkCancellation()
@@ -216,6 +218,7 @@ public final class QwenImageT2IGenerator {
             latents = latents + (sigmas[i + 1] - sigmas[i]) * noise
             eval(latents)
             prof.end(span)
+            QwenImageEditProgress.report(.denoise, step: i + 1, totalSteps: steps)
             progress?(i + 1, steps)
         }
         lastStepCacheSkips = (posStepCache != nil || negStepCache != nil)
@@ -226,6 +229,7 @@ public final class QwenImageT2IGenerator {
 
         // 5. Decode. Up to 160² latent tokens (every 1024-bucket size) this is the plain decode;
         // above, chunked attention + a halo-tiled up path keep the transient ≤ the 1024² decode's.
+        QwenImageEditProgress.report(.decode)
         let dSpan = prof.begin("vae-decode", "decode")
         let unpacked = QwenImagePipeline.unpackLatents(
             latents.asType(.float32), pixelHeight: th, pixelWidth: tw)

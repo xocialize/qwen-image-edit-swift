@@ -270,6 +270,7 @@ public final class QwenImageEditGenerator {
         //    loop so the ~16 GB encoder is not co-resident with the DiT activation peak.
         let doCFG = trueCFGScale > 1
         let prof = MLXProfiler.shared
+        QwenImageEditProgress.report(.encode)   // prompt + VAE conditioning, through step 2
         // Prompt-embedding memo (FR6b): a hit skips the per-request encoder load + encode
         // entirely — the 7B encoder never becomes resident for a re-roll.
         let promptKey = PromptCacheKey(
@@ -351,6 +352,7 @@ public final class QwenImageEditGenerator {
         // and counted under the declared peakActivationBytes headroom.
         let posStepCache = stepCache.threshold.map { DiTStepCache(threshold: $0) }
         let negStepCache = doCFG ? stepCache.threshold.map { DiTStepCache(threshold: $0) } : nil
+        QwenImageEditProgress.report(.denoise)
         for i in 0..<steps {
             // CAN cadence: cooperative cancellation once per denoise step (throwing seam —
             // the CancellationError unwinds unchanged to the engine wrapper's run()).
@@ -380,6 +382,7 @@ public final class QwenImageEditGenerator {
             latents = latents + (sigmas[i + 1] - sigmas[i]) * noise
             eval(latents)
             prof.end(span)
+            QwenImageEditProgress.report(.denoise, step: i + 1, totalSteps: steps)
             progress?(i + 1, steps)
         }
         lastStepCacheSkips = (posStepCache != nil || negStepCache != nil)
@@ -390,6 +393,7 @@ public final class QwenImageEditGenerator {
 
         // 6. Decode. Manual span around the existing eval — `decode` is lazy; its compute
         // realizes at `eval(hwc)`.
+        QwenImageEditProgress.report(.decode)
         let dSpan = prof.begin("vae-decode", "decode")
         let unpacked = QwenImagePipeline.unpackLatents(
             latents.asType(.float32), pixelHeight: th, pixelWidth: tw)

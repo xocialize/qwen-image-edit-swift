@@ -33,7 +33,8 @@ final class FlashCancellationTests: XCTestCase {
         let report = CancellationConformance.checkCadence(
             manifest: QwenImageFlashPackage.manifest,
             posture: .cadence([
-                .init(phase: .denoise, unit: .step)
+                // RunProgress-evidenced (AB-A-0139): the same loop seam reports `.denoise` i/N.
+                .init(phase: .denoise, unit: .step, reportsRunProgress: true)
             ]))
         XCTAssertTrue(report.passed, report.summary)
     }
